@@ -436,7 +436,7 @@ export default function App() {
                   />
                   <button
                     type="button"
-                    className="file-dropzone group grid min-h-[220px] cursor-pointer place-items-center rounded-[20px] border border-dashed border-[var(--line-strong)] bg-[linear-gradient(135deg,var(--paper),rgb(234_239_234/65%))] p-7 text-center transition hover:border-[var(--teal)]"
+                    className="file-dropzone group grid min-h-[220px] w-full cursor-pointer place-items-center rounded-[20px] border border-dashed border-[var(--line-strong)] bg-[linear-gradient(135deg,var(--paper),rgb(234_239_234/65%))] p-7 text-center transition hover:border-[var(--teal)]"
                     aria-label={
                       file
                         ? `Replace ${file.name} with another video`
