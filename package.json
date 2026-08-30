@@ -1,0 +1,43 @@
+{
+  "name": "ipod-ipvf-converter",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "prepare:ffmpeg": "node scripts/copy-ffmpeg.mjs",
+    "dev": "npm run prepare:ffmpeg && vite",
+    "build": "npm run typecheck && npm run prepare:ffmpeg && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src components/ui/badge.tsx components/ui/button.tsx components/ui/progress.tsx lib/utils.ts vite.config.ts",
+    "format": "oxfmt"
+  },
+  "dependencies": {
+    "@base-ui/react": "1.7.0",
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "lucide-react": "1.31.0",
+    "mediabunny": "^1.51.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "tailwind-merge": "3.6.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "oxfmt": "0.61.0",
+    "oxlint": "1.76.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "tailwindcss": "4.2.1",
+    "typescript": "5.9.3",
+    "vite": "^8.2.2"
+  },
+  "type": "module"
+}
