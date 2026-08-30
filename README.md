@@ -4,7 +4,7 @@ A fully client-side video converter for the native IPVF player in Rockbox on the
 
 **Live app:** [jspann21.github.io/ipod-ipvf-converter](https://jspann21.github.io/ipod-ipvf-converter/)
 
-The app accepts a local media file or a direct CORS-enabled media URL, converts it entirely inside the browser, validates the complete result against the Rockbox player contract, and downloads a local `.ipvf` file. Media is never uploaded to a server.
+The app accepts a local media file by file picker or drag and drop, or a direct CORS-enabled media URL. It converts entirely inside the browser, validates the complete result against the Rockbox player contract, and downloads a local `.ipvf` file. Media is never uploaded to a server.
 
 ## What it produces
 

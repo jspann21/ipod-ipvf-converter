@@ -3,6 +3,7 @@ import {
   CircleGauge,
   Download,
   ExternalLink,
+  FileUp,
   Film,
   FolderOpen,
   HardDrive,
@@ -37,6 +38,9 @@ type ProgressState = {
 };
 type CompleteResult = Extract<WorkerResponse, { type: 'complete' }>;
 
+const VIDEO_FILE_PATTERN =
+  /\.(?:3g2|3gp|avi|flv|m2ts|m4v|mkv|mov|mp4|mpeg|mpg|mts|ogv|ts|webm|wmv)$/i;
+
 const STAGE_WEIGHT: Record<ConversionStage, [number, number]> = {
   inspect: [0, 12],
   audio: [12, 30],
@@ -68,6 +72,10 @@ function formatTime(seconds: number) {
   return `${minutes}:${remainder.toFixed(1).padStart(4, '0')}`;
 }
 
+function isVideoFile(file: File) {
+  return file.type.startsWith('video/') || VIDEO_FILE_PATTERN.test(file.name);
+}
+
 async function getOutputFile(name: string) {
   const root = await navigator.storage.getDirectory();
   const handle = await root.getFileHandle(name);
@@ -83,6 +91,8 @@ export default function App() {
   const filePreviewUrlRef = useRef('');
   const [sourceMode, setSourceMode] = useState<SourceMode>('file');
   const [file, setFile] = useState<File | null>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [fileError, setFileError] = useState('');
   const [fps, setFps] = useState<30 | 60>(30);
   const [fit, setFit] = useState<FitMode>('contain');
   const [url, setUrl] = useState('');
@@ -219,6 +229,16 @@ export default function App() {
     setResult(null);
     setError('');
     setRunState('idle');
+    setFileError('');
+  }
+
+  function acceptFile(nextFile: File | null) {
+    if (!nextFile) return;
+    if (!isVideoFile(nextFile)) {
+      setFileError('Choose a video file, such as MP4, MOV, MKV, AVI, or WebM.');
+      return;
+    }
+    selectFile(nextFile);
   }
 
   function loadUrlPreview() {
@@ -403,59 +423,114 @@ export default function App() {
               </div>
 
               {sourceMode === 'file' ? (
-                <label
-                  htmlFor="video-file"
-                  className="group grid min-h-[220px] cursor-pointer place-items-center rounded-[20px] border border-dashed border-[var(--line-strong)] bg-[linear-gradient(135deg,var(--paper),rgb(234_239_234/65%))] p-7 text-center transition hover:border-[var(--teal)]"
-                >
+                <div>
                   <input
                     id="video-file"
                     ref={inputRef}
                     className="sr-only"
                     type="file"
-                    accept="video/*,.mkv,.avi,.mov,.m4v,.webm"
+                    accept="video/*,.3g2,.3gp,.avi,.flv,.m2ts,.m4v,.mkv,.mov,.mp4,.mpeg,.mpg,.mts,.ogv,.ts,.webm,.wmv"
                     onChange={(event) =>
-                      selectFile(event.target.files?.[0] ?? null)
+                      acceptFile(event.target.files?.[0] ?? null)
                     }
                   />
-                  {file ? (
-                    <div className="w-full max-w-md">
-                      <div className="mx-auto mb-4 grid size-12 place-items-center rounded-2xl bg-[var(--teal-soft)] text-[var(--teal)]">
-                        <CheckCircle2 className="size-6" />
+                  <button
+                    type="button"
+                    className="file-dropzone group grid min-h-[220px] cursor-pointer place-items-center rounded-[20px] border border-dashed border-[var(--line-strong)] bg-[linear-gradient(135deg,var(--paper),rgb(234_239_234/65%))] p-7 text-center transition hover:border-[var(--teal)]"
+                    aria-label={
+                      file
+                        ? `Replace ${file.name} with another video`
+                        : 'Choose or drop a video file'
+                    }
+                    data-dragging={isDraggingFile}
+                    onClick={() => inputRef.current?.click()}
+                    onDragEnter={(event) => {
+                      event.preventDefault();
+                      setIsDraggingFile(true);
+                    }}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = 'copy';
+                      setIsDraggingFile(true);
+                    }}
+                    onDragLeave={(event) => {
+                      if (
+                        event.relatedTarget instanceof Node &&
+                        event.currentTarget.contains(event.relatedTarget)
+                      )
+                        return;
+                      setIsDraggingFile(false);
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setIsDraggingFile(false);
+                      const droppedFile = event.dataTransfer.files[0] ?? null;
+                      if (!droppedFile) {
+                        setFileError('Drop a video file from your device.');
+                        return;
+                      }
+                      acceptFile(droppedFile);
+                      if (inputRef.current) inputRef.current.value = '';
+                    }}
+                  >
+                    {file ? (
+                      <div className="w-full max-w-md">
+                        <div className="mx-auto mb-4 grid size-12 place-items-center rounded-2xl bg-[var(--teal-soft)] text-[var(--teal)]">
+                          <CheckCircle2 className="size-6" />
+                        </div>
+                        <p className="truncate text-base font-semibold">
+                          {file.name}
+                        </p>
+                        <p className="mt-1 font-mono text-xs text-[var(--muted-ink)]">
+                          {formatBytes(file.size)} · ready to inspect
+                        </p>
+                        <p className="mt-3 text-xs text-[var(--muted-ink)]">
+                          Drop another video here to replace it
+                        </p>
                       </div>
-                      <p className="truncate text-base font-semibold">
-                        {file.name}
-                      </p>
-                      <p className="mt-1 font-mono text-xs text-[var(--muted-ink)]">
-                        {formatBytes(file.size)} · ready to inspect
-                      </p>
+                    ) : (
+                      <div>
+                        <div className="mx-auto mb-4 grid size-12 place-items-center rounded-2xl border border-[var(--line)] bg-white text-[var(--teal)] shadow-sm transition group-hover:-translate-y-0.5">
+                          <FileUp className="size-5" />
+                        </div>
+                        <p className="font-semibold">
+                          {isDraggingFile
+                            ? 'Release to add this video'
+                            : 'Drop a video here'}
+                        </p>
+                        <p className="mt-1 text-sm text-[var(--muted-ink)]">
+                          or click to browse files on this device
+                        </p>
+                        <p className="mt-4 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--faint-ink)]">
+                          Your media never leaves the browser
+                        </p>
+                      </div>
+                    )}
+                  </button>
+                  {fileError && (
+                    <p
+                      className="mt-3 text-center text-xs font-medium text-red-700"
+                      role="alert"
+                    >
+                      {fileError}
+                    </p>
+                  )}
+                  {file && (
+                    <div className="mt-3 text-center">
                       <button
-                        className="mt-4 inline-flex items-center gap-1.5 text-xs font-semibold text-[var(--teal)] hover:underline"
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-[var(--teal)] hover:underline"
                         type="button"
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
+                        onClick={() => {
                           selectFile(null);
                           if (inputRef.current) inputRef.current.value = '';
                         }}
                       >
-                        <X className="size-3.5" /> Remove
+                        <X className="size-3.5" /> Remove selected file
                       </button>
                     </div>
-                  ) : (
-                    <div>
-                      <div className="mx-auto mb-4 grid size-12 place-items-center rounded-2xl border border-[var(--line)] bg-white text-[var(--teal)] shadow-sm transition group-hover:-translate-y-0.5">
-                        <FolderOpen className="size-5" />
-                      </div>
-                      <p className="font-semibold">Choose a video</p>
-                      <p className="mt-1 text-sm text-[var(--muted-ink)]">
-                        browse files on this device
-                      </p>
-                      <p className="mt-4 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--faint-ink)]">
-                        Your media never leaves the browser
-                      </p>
-                    </div>
                   )}
-                </label>
+                </div>
               ) : (
                 <div className="min-h-[220px] rounded-[20px] border border-[var(--line)] bg-[var(--paper)] p-5 sm:p-7">
                   <label
