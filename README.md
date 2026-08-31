@@ -11,14 +11,14 @@ The app accepts a local media file by file picker or drag and drop, or a direct 
 - 220×176 RGB565 big-endian video with selectable letterbox, crop, or stretch framing
 - 30 or 60 fps output
 - A seekable single-frame 220×176 preview with letterbox, crop-to-fill, and stretch-to-fill framing
-- Lossless full keyframes, aligned bounding-rectangle deltas, and repeat records
+- Lossless raw/LZ4 keyframes, aligned single- or multi-rectangle deltas, and repeat records
 - A forced keyframe every 120 frames
-- 44.1 kHz stereo signed 16-bit little-endian PCM
-- Exact per-frame PCM boundaries using `round(frame × 44100 / fps)`
-- 512-byte sector-aligned records with a maximum record size of 128 KiB
+- 44.1 kHz stereo IMA ADPCM with independently decodable frame blocks
+- Exact per-frame audio boundaries using `round(frame × 44100 / fps)`
+- 512-byte sector-aligned records with a maximum record size of 96 KiB
 - A canonical header and complete next-record sector chain
 
-Every generated file is validated before download. Validation checks the header, fixed padding, frame count, audio duration, record sizes, chain links, first/final record rules, key/repeat payloads, rectangle bounds and two-pixel alignment, PCM placement, sector padding, and exact end of file.
+Every generated file is validated before download. Validation checks the header, fixed padding, frame count, audio duration, record sizes, chain links, first/final record rules, raw and LZ4 payloads, reconstructed keys and rectangles, IMA ADPCM blocks, sector padding, and exact end of file.
 
 ## Browser architecture
 
@@ -29,8 +29,8 @@ The UI and conversion pipeline are static files suitable for GitHub Pages.
 3. If the container is readable but its codecs are not, the single-threaded [ffmpeg.wasm](https://ffmpegwasm.netlify.app/) compatibility path normalizes it to H.264/AAC, then returns to the same canonical IPVF path.
 4. A browser video canvas shows a seekable still preview at the exact 220×176 output ratio. The selected letterbox (`contain`), crop-to-fill (`cover`), or stretch-to-fill (`fill`) mode is passed to the worker.
 5. An `OffscreenCanvas` applies that framing to every requested output frame. Pixels are packed as RGB565BE.
-6. Decoded audio is resampled and written into an OPFS temporary file at its media timestamps. Missing audio becomes silence; excess audio is trimmed to the video duration.
-7. IPVF records are incrementally written to OPFS. Only the previous frame and at most two records are retained in working memory.
+6. Decoded audio is resampled and written into an OPFS temporary file at its media timestamps. Missing audio becomes silence; excess audio is trimmed to the video duration. Each record's slice is then encoded as anchored stereo IMA ADPCM.
+7. IPVF records are incrementally written to OPFS. The encoder evaluates raw/LZ4 keys, repeats, and bounded spatial rectangle candidates using final sector cost.
 8. The validator re-reads the finished file from OPFS. Download uses a file-backed `Blob`; “Save as” streams directly to a user-selected destination when the File System Access API is available.
 
 The software fallback is intentionally single-threaded. GitHub Pages cannot set the cross-origin isolation headers required by the multithreaded ffmpeg.wasm core. The WebCodecs path remains the preferred path because it is faster and avoids an intermediate compatibility transcode.
@@ -55,11 +55,11 @@ Use a local file you are permitted to convert, or a direct media URL whose serve
 
 The browser encoder is a port of the production format contract in:
 
-- [`tools/ipvf/encode.py`](https://github.com/jspann21/rockbox-ipod-photo/blob/1ba0c01837085d475fb8e8e41416dbfb1cb9a5aa/tools/ipvf/encode.py)
-- [`tools/ipvf/README.md`](https://github.com/jspann21/rockbox-ipod-photo/blob/1ba0c01837085d475fb8e8e41416dbfb1cb9a5aa/tools/ipvf/README.md)
-- the target parser in [`apps/plugins/ipodnative.c`](https://github.com/jspann21/rockbox-ipod-photo/blob/1ba0c01837085d475fb8e8e41416dbfb1cb9a5aa/apps/plugins/ipodnative.c)
+- [`tools/ipvf/encode.py`](https://github.com/jspann21/rockbox-ipod-photo/blob/c5b5295cbcf3cea0bf8d00d16d55d7a72ccf15af/tools/ipvf/encode.py)
+- [`tools/ipvf/README.md`](https://github.com/jspann21/rockbox-ipod-photo/blob/c5b5295cbcf3cea0bf8d00d16d55d7a72ccf15af/tools/ipvf/README.md)
+- the target parser in [`apps/plugins/ipodnative.c`](https://github.com/jspann21/rockbox-ipod-photo/blob/c5b5295cbcf3cea0bf8d00d16d55d7a72ccf15af/apps/plugins/ipodnative.c)
 
-Reference Rockbox commit: `1ba0c01837085d475fb8e8e41416dbfb1cb9a5aa`.
+Reference Rockbox commit: `c5b5295cbcf3cea0bf8d00d16d55d7a72ccf15af`.
 
 The browser implementation does not define IPVF v2 or a separate web dialect. Structural compatibility is governed by the production encoder and player.
 

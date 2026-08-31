@@ -23,9 +23,11 @@ import {
   buildHeader,
   buildRecord,
   chooseVideoRecord,
+  encodeImaAdpcm,
   recordSectors,
   rgbaToRgb565be,
   validateIpvf,
+  type ImaState,
   type SyncRandomAccessFile,
   type VideoRecord,
 } from '../lib/ipvf';
@@ -315,6 +317,7 @@ async function writeVideoRecords(
   } | null = null;
   let firstRecordSectors = 0;
   let frameIndex = 0;
+  let imaState: ImaState = { leftIndex: 0, rightIndex: 0 };
 
   const samples = sink.samplesAtTimestamps(
     timestamps(videoStart, frameCount, fps),
@@ -332,19 +335,31 @@ async function writeVideoRecords(
       sample.drawWithFit(context, { fit });
       const rgba = context.getImageData(0, 0, IPVF.width, IPVF.height).data;
       const currentFrame = rgbaToRgb565be(rgba);
-      const video = chooseVideoRecord(previousFrame, currentFrame, frameIndex);
       const audioStart = audioBoundary(frameIndex, fps);
       const audioEnd = audioBoundary(frameIndex + 1, fps);
-      const audioBytes = new Uint8Array(
+      const pcmBytes = new Uint8Array(
         (audioEnd - audioStart) * IPVF.audioFrameBytes,
       );
-      const read = audio.read(audioBytes, {
+      const read = audio.read(pcmBytes, {
         at: audioStart * IPVF.audioFrameBytes,
       });
-      if (read !== audioBytes.byteLength)
+      if (read !== pcmBytes.byteLength)
         throw new Error(
           `Could not read the PCM slice for frame ${frameIndex + 1}.`,
         );
+      const encodedAudio = encodeImaAdpcm(
+        pcmBytes,
+        audioEnd - audioStart,
+        imaState,
+      );
+      imaState = encodedAudio.state;
+      const audioBytes = encodedAudio.payload;
+      const video = chooseVideoRecord(
+        previousFrame,
+        currentFrame,
+        frameIndex,
+        audioBytes.byteLength,
+      );
       const sectors = recordSectors(
         video.payload.byteLength,
         audioBytes.byteLength,
@@ -366,7 +381,7 @@ async function writeVideoRecords(
           jobId,
           'video',
           frameIndex / frameCount,
-          'Scaling and packing canonical frame records',
+          'Compressing video and IMA ADPCM frame records',
           {
             bytesWritten: outputPosition,
             frame: frameIndex,

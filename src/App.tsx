@@ -821,7 +821,7 @@ export default function App() {
                 <div className="flex items-center justify-between gap-4">
                   <dt className="text-white/55">Audio</dt>
                   <dd className="font-mono text-[11px]">
-                    44.1 kHz · stereo PCM
+                    44.1 kHz · stereo IMA ADPCM
                   </dd>
                 </div>
                 <div className="flex items-center justify-between gap-4">
