@@ -12,22 +12,30 @@ import {
 import { FFmpeg, FFFSType } from '@ffmpeg/ffmpeg';
 
 import {
-  type FitMode,
   type StartConversionMessage,
   type WorkerRequest,
   type WorkerResponse,
 } from '../lib/messages';
 import {
   IPVF,
+  RECORD_TYPE,
   audioBoundary,
   buildHeader,
+  buildIndex,
   buildRecord,
   chooseVideoRecord,
-  encodeImaAdpcm,
+  encodeAdaptiveIma,
+  indexFlagsForKind,
+  isKeyRecord,
+  keyIntervalFrames,
   recordSectors,
+  rockboxCrc32,
   rgbaToRgb565be,
   validateIpvf,
+  type FrameRate,
   type ImaState,
+  type IpvfMetadata,
+  type KeyframeIndexEntry,
   type SyncRandomAccessFile,
   type VideoRecord,
 } from '../lib/ipvf';
@@ -160,7 +168,7 @@ async function normalizeWithFfmpeg(
     '-map',
     '0:v:0',
     '-map',
-    '0:a:0',
+    '0:a:0?',
     '-c:v',
     'libx264',
     '-preset',
@@ -275,13 +283,66 @@ async function decodeAudio(
   );
 }
 
-function timestamps(start: number, frameCount: number, fps: number) {
+function timestamps(start: number, frameCount: number, frameRate: FrameRate) {
   return {
     *[Symbol.iterator]() {
       for (let frame = 0; frame < frameCount; frame += 1)
-        yield start + frame / fps;
+        yield start + (frame * frameRate.denominator) / frameRate.numerator;
     },
   };
+}
+
+function greatestCommonDivisor(left: number, right: number) {
+  while (right) [left, right] = [right, left % right];
+  return left;
+}
+
+function approximateFrameRate(value: number): FrameRate {
+  if (!Number.isFinite(value) || value <= 0)
+    return { numerator: 30, denominator: 1 };
+  const commonRates: FrameRate[] = [
+    { numerator: 24_000, denominator: 1_001 },
+    { numerator: 24, denominator: 1 },
+    { numerator: 25, denominator: 1 },
+    { numerator: 30_000, denominator: 1_001 },
+    { numerator: 30, denominator: 1 },
+    { numerator: 50, denominator: 1 },
+    { numerator: 60_000, denominator: 1_001 },
+    { numerator: 60, denominator: 1 },
+  ];
+  const common = commonRates.find(
+    (rate) => Math.abs(value - rate.numerator / rate.denominator) < 0.02,
+  );
+  if (common) return common;
+  let numerator = Math.round(value * 1_000);
+  let denominator = 1_000;
+  const divisor = greatestCommonDivisor(numerator, denominator);
+  numerator /= divisor;
+  denominator /= divisor;
+  if (numerator > 0xffff || denominator > 0xffff)
+    return { numerator: Math.round(value), denominator: 1 };
+  return { numerator, denominator };
+}
+
+function resolveFrameRate(
+  message: StartConversionMessage,
+  sourceRate: number,
+): FrameRate {
+  if (message.frameRate !== 'profile') return message.frameRate;
+  if (message.profile === 'compact') return { numerator: 20, denominator: 1 };
+  return approximateFrameRate(Math.max(4, Math.min(30, sourceRate)));
+}
+
+function sourceMetadata(
+  tags: { title?: string; artist?: string; album?: string },
+  overrides: IpvfMetadata,
+) {
+  const metadata: IpvfMetadata = {};
+  for (const name of ['title', 'artist', 'album'] as const) {
+    const value = overrides[name]?.trim() || tags[name]?.trim();
+    if (value) metadata[name] = value;
+  }
+  return metadata;
 }
 
 async function writeVideoRecords(
@@ -291,8 +352,9 @@ async function writeVideoRecords(
   audio: SyncRandomAccessFile,
   videoStart: number,
   frameCount: number,
-  fps: number,
-  fit: FitMode,
+  frameRate: FrameRate,
+  message: StartConversionMessage,
+  metadata: IpvfMetadata,
 ) {
   const canvas = new OffscreenCanvas(IPVF.width, IPVF.height);
   const context = canvas.getContext('2d', {
@@ -314,13 +376,35 @@ async function writeVideoRecords(
     video: VideoRecord;
     audio: Uint8Array;
     sectors: number;
+    frame: number;
   } | null = null;
   let firstRecordSectors = 0;
   let frameIndex = 0;
   let imaState: ImaState = { leftIndex: 0, rightIndex: 0 };
+  let mediaId = 0xffffffff;
+  let temporalRecords = false;
+  const indexEntries: KeyframeIndexEntry[] = [];
+  const keyInterval = keyIntervalFrames(frameRate, message.keySeconds);
+  const rateValue = frameRate.numerator / frameRate.denominator;
+  const videoMode =
+    message.videoMode === 'default'
+      ? rateValue <= 30
+        ? 'motion'
+        : 'spatial'
+      : message.videoMode;
+  if ((videoMode === 'motion' || videoMode === 'auto') && rateValue > 30)
+    throw new Error(
+      'Motion and auto video modes are qualified only at 30 fps or lower.',
+    );
+  if (
+    !Number.isInteger(message.maxRectangles) ||
+    message.maxRectangles < 1 ||
+    message.maxRectangles > 255
+  )
+    throw new Error('Maximum rectangles must be between 1 and 255.');
 
   const samples = sink.samplesAtTimestamps(
-    timestamps(videoStart, frameCount, fps),
+    timestamps(videoStart, frameCount, frameRate),
   );
   for await (const sample of samples) {
     assertActive(jobId);
@@ -332,11 +416,11 @@ async function writeVideoRecords(
     try {
       context.fillStyle = '#000';
       context.fillRect(0, 0, IPVF.width, IPVF.height);
-      sample.drawWithFit(context, { fit });
+      sample.drawWithFit(context, { fit: message.fit });
       const rgba = context.getImageData(0, 0, IPVF.width, IPVF.height).data;
-      const currentFrame = rgbaToRgb565be(rgba);
-      const audioStart = audioBoundary(frameIndex, fps);
-      const audioEnd = audioBoundary(frameIndex + 1, fps);
+      const currentFrame = rgbaToRgb565be(rgba, message.colorDepth);
+      const audioStart = audioBoundary(frameIndex, frameRate);
+      const audioEnd = audioBoundary(frameIndex + 1, frameRate);
       const pcmBytes = new Uint8Array(
         (audioEnd - audioStart) * IPVF.audioFrameBytes,
       );
@@ -347,7 +431,7 @@ async function writeVideoRecords(
         throw new Error(
           `Could not read the PCM slice for frame ${frameIndex + 1}.`,
         );
-      const encodedAudio = encodeImaAdpcm(
+      const encodedAudio = encodeAdaptiveIma(
         pcmBytes,
         audioEnd - audioStart,
         imaState,
@@ -359,6 +443,11 @@ async function writeVideoRecords(
         currentFrame,
         frameIndex,
         audioBytes.byteLength,
+        {
+          keyInterval,
+          videoMode,
+          maxRectangles: message.maxRectangles,
+        },
       );
       const sectors = recordSectors(
         video.payload.byteLength,
@@ -369,10 +458,24 @@ async function writeVideoRecords(
         firstRecordSectors = sectors;
       } else {
         const record = buildRecord(pending.video, pending.audio, sectors);
+        if (isKeyRecord(pending.video.kind)) {
+          indexEntries.push({
+            frame: pending.frame,
+            offset: outputPosition,
+            sectors: pending.sectors,
+            flags: indexFlagsForKind(pending.video.kind),
+          });
+        }
+        if (
+          pending.video.kind === RECORD_TYPE.temporalXorLz4 ||
+          pending.video.kind === RECORD_TYPE.motionLz4
+        )
+          temporalRecords = true;
         output.write(record, { at: outputPosition });
+        mediaId = rockboxCrc32(record, mediaId);
         outputPosition += record.byteLength;
       }
-      pending = { video, audio: audioBytes, sectors };
+      pending = { video, audio: audioBytes, sectors, frame: frameIndex };
       previousFrame = currentFrame;
       frameIndex += 1;
 
@@ -401,15 +504,50 @@ async function writeVideoRecords(
     );
   }
   const finalRecord = buildRecord(pending.video, pending.audio, 0);
+  if (isKeyRecord(pending.video.kind)) {
+    indexEntries.push({
+      frame: pending.frame,
+      offset: outputPosition,
+      sectors: pending.sectors,
+      flags: indexFlagsForKind(pending.video.kind),
+    });
+  }
+  if (
+    pending.video.kind === RECORD_TYPE.temporalXorLz4 ||
+    pending.video.kind === RECORD_TYPE.motionLz4
+  )
+    temporalRecords = true;
   output.write(finalRecord, { at: outputPosition });
+  mediaId = rockboxCrc32(finalRecord, mediaId);
   outputPosition += finalRecord.byteLength;
-  output.write(buildHeader(fps, frameCount, firstRecordSectors), { at: 0 });
+  const mediaEndOffset = outputPosition;
+  const index = buildIndex(indexEntries);
+  output.write(index, { at: outputPosition });
+  outputPosition += index.byteLength;
+  if (outputPosition > IPVF.maxFileBytes)
+    throw new Error(
+      'The converted file exceeds the iPod filesystem size limit.',
+    );
+  output.write(
+    buildHeader({
+      frameRate,
+      frameCount,
+      firstRecordSectors,
+      flags: IPVF.flags | (temporalRecords ? IPVF.temporalFlag : 0),
+      mediaEndOffset,
+      indexCount: indexEntries.length,
+      indexCrc: rockboxCrc32(index),
+      mediaId,
+      metadata,
+    }),
+    { at: 0 },
+  );
   output.truncate(outputPosition);
   output.flush();
 }
 
 async function convert(message: StartConversionMessage) {
-  const { jobId, fps, outputName } = message;
+  const { jobId, outputName } = message;
   const root = await navigator.storage.getDirectory();
   const audioName = safeStorageName(jobId, 'audio.pcm');
   const opfsName = safeStorageName(jobId, 'output.ipvf');
@@ -443,20 +581,25 @@ async function convert(message: StartConversionMessage) {
     let audioTrack = await input.getPrimaryAudioTrack();
     if (!videoTrack)
       throw new Error('The selected source does not contain a video track.');
-    if (!audioTrack)
-      throw new Error(
-        'IPVF requires an audio track, but this source has none.',
-      );
 
-    let [videoCanDecode, audioCanDecode, videoCodec, audioCodec] =
-      await Promise.all([
-        videoTrack.canDecode(),
-        audioTrack.canDecode(),
-        videoTrack.getCodecParameterString(),
-        audioTrack.getCodecParameterString(),
-      ]);
+    const [packetStats, inputMetadata] = await Promise.all([
+      videoTrack.computePacketStats(120).catch(() => null),
+      input.getMetadataTags().catch(() => ({})),
+    ]);
+    const frameRate = resolveFrameRate(
+      message,
+      packetStats?.averagePacketRate ?? 30,
+    );
+    const metadata = sourceMetadata(inputMetadata, message.metadata);
+
+    let videoCanDecode = await videoTrack.canDecode();
+    let audioCanDecode = audioTrack ? await audioTrack.canDecode() : true;
+    let videoCodec = await videoTrack.getCodecParameterString();
+    let audioCodec = audioTrack
+      ? await audioTrack.getCodecParameterString()
+      : null;
     sourceVideoCodec = videoCodec ?? 'unknown';
-    sourceAudioCodec = audioCodec ?? 'unknown';
+    sourceAudioCodec = audioTrack ? (audioCodec ?? 'unknown') : 'none';
     if (!videoCanDecode || !audioCanDecode) {
       const blob = await sourceBlob(message);
       const normalized = await normalizeWithFfmpeg(
@@ -472,17 +615,16 @@ async function convert(message: StartConversionMessage) {
       activeInput = input;
       videoTrack = await input.getPrimaryVideoTrack();
       audioTrack = await input.getPrimaryAudioTrack();
-      if (!videoTrack || !audioTrack)
+      if (!videoTrack)
         throw new Error(
-          'The compatibility decoder did not preserve both media tracks.',
+          'The compatibility decoder did not preserve the video track.',
         );
-      [videoCanDecode, audioCanDecode, videoCodec, audioCodec] =
-        await Promise.all([
-          videoTrack.canDecode(),
-          audioTrack.canDecode(),
-          videoTrack.getCodecParameterString(),
-          audioTrack.getCodecParameterString(),
-        ]);
+      videoCanDecode = await videoTrack.canDecode();
+      audioCanDecode = audioTrack ? await audioTrack.canDecode() : true;
+      videoCodec = await videoTrack.getCodecParameterString();
+      audioCodec = audioTrack
+        ? await audioTrack.getCodecParameterString()
+        : null;
       if (!videoCanDecode || !audioCanDecode) {
         throw new Error(
           'This browser cannot decode the compatibility output. Try a current Chromium browser.',
@@ -500,26 +642,38 @@ async function convert(message: StartConversionMessage) {
     const duration = videoEnd - start;
     if (!Number.isFinite(duration) || duration <= 0)
       throw new Error('The video has no usable duration.');
-    const frameCount = Math.max(1, Math.ceil(duration * fps - 1e-9));
-    if (audioBoundary(frameCount, fps) > 0xffffffff)
+    const rateValue = frameRate.numerator / frameRate.denominator;
+    const frameCount = Math.max(1, Math.ceil(duration * rateValue - 1e-9));
+    if (audioBoundary(frameCount, frameRate) > 0xffffffff)
       throw new Error('This video is longer than the IPVF duration limit.');
 
     progress(
       jobId,
       'inspect',
       1,
-      `${duration.toFixed(2)} seconds · ${frameCount.toLocaleString()} output frames`,
+      `${duration.toFixed(2)} seconds · ${frameCount.toLocaleString()} frames @ ${frameRate.numerator}/${frameRate.denominator} fps`,
     );
-    const audioSink = new AudioSampleSink(audioTrack);
-    const targetAudioFrames = audioBoundary(frameCount, fps);
-    await decodeAudio(
-      jobId,
-      audioSink,
-      audioFile,
-      start,
-      start + duration,
-      targetAudioFrames,
-    );
+    const targetAudioFrames = audioBoundary(frameCount, frameRate);
+    if (audioTrack) {
+      const audioSink = new AudioSampleSink(audioTrack);
+      await decodeAudio(
+        jobId,
+        audioSink,
+        audioFile,
+        start,
+        start + duration,
+        targetAudioFrames,
+      );
+    } else {
+      audioFile.truncate(targetAudioFrames * IPVF.audioFrameBytes);
+      audioFile.flush();
+      progress(
+        jobId,
+        'audio',
+        1,
+        'No source audio; encoding exact digital silence',
+      );
+    }
     assertActive(jobId);
 
     const videoSink = new VideoSampleSink(videoTrack);
@@ -530,8 +684,9 @@ async function convert(message: StartConversionMessage) {
       audioFile,
       start,
       frameCount,
-      fps,
-      message.fit,
+      frameRate,
+      message,
+      metadata,
     );
     assertActive(jobId);
 

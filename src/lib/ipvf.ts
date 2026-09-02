@@ -2,12 +2,11 @@ export const IPVF = {
   width: 220,
   height: 176,
   frameBytes: 220 * 176 * 2,
-  headerSize: 64,
+  headerSize: 80,
   dataOffset: 512,
   sectorSize: 512,
-  recordHeaderSize: 12,
+  recordHeaderSize: 16,
   maxRecordSectors: 192,
-  version: 1,
   flags: 11,
   temporalFlag: 16,
   audioFormat: 2,
@@ -15,8 +14,12 @@ export const IPVF = {
   audioBitsPerSample: 16,
   audioSampleRate: 44_100,
   audioFrameBytes: 4,
-  keyInterval: 120,
+  defaultKeySeconds: 5,
   maxRectangles: 8,
+  indexEntrySize: 16,
+  indexKeyLz4Flag: 1,
+  metadataOffset: 80,
+  maxFileBytes: 0x7fffffff,
 } as const;
 
 export const RECORD_TYPE = {
@@ -26,6 +29,7 @@ export const RECORD_TYPE = {
   keyLz4: 3,
   rectanglesLz4: 4,
   temporalXorLz4: 5,
+  motionLz4: 6,
 } as const;
 
 export type RecordType = (typeof RECORD_TYPE)[keyof typeof RECORD_TYPE];
@@ -35,6 +39,19 @@ export type VideoRecord = {
   rectangleCount: number;
   payload: Uint8Array;
   decodedBytes: number;
+};
+
+export type FrameRate = {
+  numerator: number;
+  denominator: number;
+};
+
+export type ColorDepth = 'rgb565' | 'rgb555' | 'rgb454' | 'rgb444';
+export type VideoMode = 'current' | 'spatial' | 'motion' | 'auto';
+export type IpvfMetadata = {
+  title?: string;
+  artist?: string;
+  album?: string;
 };
 
 export type ImaState = {
@@ -47,6 +64,14 @@ export type ValidationReport = {
   fps: number;
   audioSampleFrames: number;
   fileBytes: number;
+  fpsNumerator: number;
+  fpsDenominator: number;
+  indexCount: number;
+  mediaId: string;
+  metadata: IpvfMetadata;
+  silentAudioRecords: number;
+  monoAudioRecords: number;
+  stereoAudioRecords: number;
   keyframes: number;
   rectangles: number;
   repeats: number;
@@ -82,14 +107,52 @@ const IMA_STEP_TABLE = [
   32767,
 ] as const;
 
-export function audioBoundary(frame: number, fps: number) {
-  return Math.floor((frame * IPVF.audioSampleRate + Math.floor(fps / 2)) / fps);
+function normalizeFrameRate(rate: FrameRate | number): FrameRate {
+  const value =
+    typeof rate === 'number' ? { numerator: rate, denominator: 1 } : rate;
+  if (
+    !Number.isInteger(value.numerator) ||
+    !Number.isInteger(value.denominator) ||
+    value.numerator <= 0 ||
+    value.numerator > 0xffff ||
+    value.denominator <= 0 ||
+    value.denominator > 0xffff ||
+    value.numerator / value.denominator < 4 ||
+    value.numerator / value.denominator > 240
+  ) {
+    throw new Error('Frame rate is outside IPVF rational bounds.');
+  }
+  return value;
 }
 
-export function imaPayloadBytes(audioFrames: number) {
+export function audioBoundary(frame: number, frameRate: FrameRate | number) {
+  const rate = normalizeFrameRate(frameRate);
+  const numerator = frame * IPVF.audioSampleRate * rate.denominator;
+  return Math.floor(
+    (numerator + Math.floor(rate.numerator / 2)) / rate.numerator,
+  );
+}
+
+export function keyIntervalFrames(
+  frameRate: FrameRate,
+  seconds: number = IPVF.defaultKeySeconds,
+) {
+  const rate = normalizeFrameRate(frameRate);
+  if (!Number.isFinite(seconds) || seconds <= 0)
+    throw new Error('Keyframe interval must be positive.');
+  return Math.max(1, Math.floor((rate.numerator * seconds) / rate.denominator));
+}
+
+export function stereoImaPayloadBytes(audioFrames: number) {
   if (audioFrames <= 0)
     throw new Error('IMA ADPCM records require at least one audio frame.');
   return 8 + audioFrames - 1;
+}
+
+export function monoImaPayloadBytes(audioFrames: number) {
+  if (audioFrames <= 0)
+    throw new Error('IMA ADPCM records require at least one audio frame.');
+  return 4 + Math.floor(audioFrames / 2);
 }
 
 export function recordSectors(videoBytes: number, audioBytes: number) {
@@ -104,7 +167,10 @@ export function recordSectors(videoBytes: number, audioBytes: number) {
   return sectors;
 }
 
-export function rgbaToRgb565be(rgba: Uint8ClampedArray) {
+export function rgbaToRgb565be(
+  rgba: Uint8ClampedArray,
+  colorDepth: ColorDepth = 'rgb565',
+) {
   if (rgba.byteLength !== IPVF.width * IPVF.height * 4) {
     throw new Error('Unexpected canvas frame size.');
   }
@@ -115,10 +181,23 @@ export function rgbaToRgb565be(rgba: Uint8ClampedArray) {
     source < rgba.length;
     source += 4, target += 2
   ) {
-    const value =
-      ((rgba[source] >> 3) << 11) |
-      ((rgba[source + 1] >> 2) << 5) |
-      (rgba[source + 2] >> 3);
+    let red = rgba[source];
+    let green = rgba[source + 1];
+    let blue = rgba[source + 2];
+    if (colorDepth === 'rgb555') {
+      red &= 0xf8;
+      green &= 0xf8;
+      blue &= 0xf8;
+    } else if (colorDepth === 'rgb454') {
+      red &= 0xf0;
+      green &= 0xf8;
+      blue &= 0xf0;
+    } else if (colorDepth === 'rgb444') {
+      red &= 0xf0;
+      green &= 0xf0;
+      blue &= 0xf0;
+    }
+    const value = ((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3);
     result[target] = value >> 8;
     result[target + 1] = value & 0xff;
   }
@@ -161,7 +240,7 @@ function imaCode(predictor: number, target: number, index: number) {
   return code;
 }
 
-export function encodeImaAdpcm(
+function encodeStereoImaAdpcm(
   pcm: Uint8Array,
   frames: number,
   state: ImaState,
@@ -180,7 +259,7 @@ export function encodeImaAdpcm(
   }
 
   const input = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-  const payload = new Uint8Array(imaPayloadBytes(frames));
+  const payload = new Uint8Array(stereoImaPayloadBytes(frames));
   const header = new DataView(payload.buffer);
   let left = input.getInt16(0, true);
   let right = input.getInt16(2, true);
@@ -208,9 +287,85 @@ export function encodeImaAdpcm(
   return { payload, state: { leftIndex, rightIndex } };
 }
 
+function encodeMonoImaAdpcm(pcm: Uint8Array, frames: number, index: number) {
+  if (frames <= 0 || pcm.byteLength !== frames * IPVF.audioFrameBytes)
+    throw new Error('PCM does not contain the requested audio frame count.');
+  const input = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+  let predictor = input.getInt16(0, true);
+  if (predictor !== input.getInt16(2, true))
+    throw new Error('PCM is not dual mono.');
+  const payload = new Uint8Array(monoImaPayloadBytes(frames));
+  new DataView(payload.buffer).setInt16(0, predictor, true);
+  payload[2] = index;
+  let pending = 0;
+  for (let frame = 1; frame < frames; frame += 1) {
+    const target = input.getInt16(frame * 4, true);
+    if (target !== input.getInt16(frame * 4 + 2, true))
+      throw new Error('PCM is not dual mono.');
+    const code = imaCode(predictor, target, index);
+    const next = imaStep(predictor, index, code);
+    predictor = next.predictor;
+    index = next.index;
+    if ((frame - 1) & 1)
+      payload[4 + Math.floor((frame - 1) / 2)] = pending | (code << 4);
+    else pending = code;
+  }
+  if ((frames - 1) & 1) payload[payload.byteLength - 1] = pending;
+  return { payload, index };
+}
+
+export function encodeAdaptiveIma(
+  pcm: Uint8Array,
+  frames: number,
+  state: ImaState,
+) {
+  if (frames <= 0 || pcm.byteLength !== frames * IPVF.audioFrameBytes)
+    throw new Error('PCM does not contain the requested audio frame count.');
+  if (pcm.every((value) => value === 0))
+    return { payload: EMPTY, state, mode: 'silence' as const };
+  const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+  let dualMono = true;
+  for (let frame = 0; frame < frames; frame += 1) {
+    if (view.getInt16(frame * 4, true) !== view.getInt16(frame * 4 + 2, true)) {
+      dualMono = false;
+      break;
+    }
+  }
+  if (dualMono) {
+    const encoded = encodeMonoImaAdpcm(pcm, frames, state.leftIndex);
+    return {
+      payload: encoded.payload,
+      state: { leftIndex: encoded.index, rightIndex: encoded.index },
+      mode: 'mono' as const,
+    };
+  }
+  const encoded = encodeStereoImaAdpcm(pcm, frames, state);
+  return { ...encoded, mode: 'stereo' as const };
+}
+
 function decodeImaAdpcm(payload: Uint8Array, frames: number) {
+  assert(frames > 0, 'Invalid IMA ADPCM block length.');
+  if (!payload.byteLength) return;
+  if (payload.byteLength === monoImaPayloadBytes(frames)) {
+    const view = new DataView(
+      payload.buffer,
+      payload.byteOffset,
+      payload.byteLength,
+    );
+    let predictor = view.getInt16(0, true);
+    let index = payload[2];
+    assert(payload[3] === 0 && index <= 88, 'Invalid IMA ADPCM block header.');
+    for (let sample = 1; sample < frames; sample += 1) {
+      const packed = payload[4 + Math.floor((sample - 1) / 2)];
+      const code = (sample - 1) & 1 ? packed >> 4 : packed & 0x0f;
+      const next = imaStep(predictor, index, code);
+      predictor = next.predictor;
+      index = next.index;
+    }
+    return;
+  }
   assert(
-    frames > 0 && payload.byteLength === imaPayloadBytes(frames),
+    payload.byteLength === stereoImaPayloadBytes(frames),
     'Invalid IMA ADPCM block length.',
   );
   const view = new DataView(
@@ -490,7 +645,7 @@ function rectanglesPayload(frame: Uint8Array, rectangles: Rectangle[]) {
 function multiRectangleDiff(
   previous: Uint8Array,
   current: Uint8Array,
-  maxRectangles = IPVF.maxRectangles,
+  maxRectangles: number = IPVF.maxRectangles,
 ) {
   const tilePairs = 4;
   const tileRows = 4;
@@ -658,14 +813,118 @@ function compressIfSmaller(
   return { kind, rectangleCount, payload, decodedBytes: payload.byteLength };
 }
 
+function xorFrames(previous: Uint8Array, current: Uint8Array) {
+  const result = new Uint8Array(IPVF.frameBytes);
+  for (let index = 0; index < result.byteLength; index += 1)
+    result[index] = previous[index] ^ current[index];
+  return result;
+}
+
+function translateFrame(previous: Uint8Array, dx: number, dy: number) {
+  if (Math.abs(dx) >= IPVF.width || Math.abs(dy) >= IPVF.height)
+    throw new Error('Translation leaves no overlapping pixels.');
+  const predicted = new Uint8Array(IPVF.frameBytes);
+  const sourceX = Math.max(0, -dx);
+  const targetX = Math.max(0, dx);
+  const sourceY = Math.max(0, -dy);
+  const targetY = Math.max(0, dy);
+  const width = IPVF.width - Math.abs(dx);
+  const height = IPVF.height - Math.abs(dy);
+  const rowBytes = width * 2;
+  for (let row = 0; row < height; row += 1) {
+    const source = ((sourceY + row) * IPVF.width + sourceX) * 2;
+    const target = ((targetY + row) * IPVF.width + targetX) * 2;
+    predicted.set(previous.subarray(source, source + rowBytes), target);
+  }
+  return predicted;
+}
+
+function estimateTranslation(
+  previous: Uint8Array,
+  current: Uint8Array,
+  maxShift = 16,
+  sampleStep = 12,
+) {
+  const scoreCache = new Map<string, [number, number]>();
+  const score = (dx: number, dy: number): [number, number] => {
+    const key = `${dx},${dy}`;
+    const cached = scoreCache.get(key);
+    if (cached) return cached;
+    const x0 = Math.max(0, dx);
+    const x1 = Math.min(IPVF.width, IPVF.width + dx);
+    const y0 = Math.max(0, dy);
+    const y1 = Math.min(IPVF.height, IPVF.height + dy);
+    let total = 0;
+    let count = 0;
+    for (let y = y0; y < y1; y += sampleStep) {
+      let currentOffset = (y * IPVF.width + x0) * 2;
+      let previousOffset = ((y - dy) * IPVF.width + x0 - dx) * 2;
+      for (let x = x0; x < x1; x += sampleStep) {
+        total += Math.abs(current[currentOffset] - previous[previousOffset]);
+        total += Math.abs(
+          current[currentOffset + 1] - previous[previousOffset + 1],
+        );
+        count += 1;
+        currentOffset += sampleStep * 2;
+        previousOffset += sampleStep * 2;
+      }
+    }
+    const result: [number, number] = [total, count];
+    scoreCache.set(key, result);
+    return result;
+  };
+  const better = (candidate: [number, number], best: [number, number]) => {
+    const [candidateScore, candidateCount] = score(...candidate);
+    const [bestScore, bestCount] = score(...best);
+    const left = candidateScore * bestCount;
+    const right = bestScore * candidateCount;
+    if (left !== right) return left < right;
+    const candidateDistance = Math.abs(candidate[0]) + Math.abs(candidate[1]);
+    const bestDistance = Math.abs(best[0]) + Math.abs(best[1]);
+    if (candidateDistance !== bestDistance)
+      return candidateDistance < bestDistance;
+    return candidate[0] !== best[0]
+      ? candidate[0] < best[0]
+      : candidate[1] < best[1];
+  };
+  let best: [number, number] = [0, 0];
+  for (let dy = -maxShift; dy <= maxShift; dy += 2) {
+    for (let dx = -maxShift; dx <= maxShift; dx += 2) {
+      if (better([dx, dy], best)) best = [dx, dy];
+    }
+  }
+  const coarseBest = best;
+  for (
+    let dy = Math.max(-maxShift, coarseBest[1] - 2);
+    dy <= Math.min(maxShift, coarseBest[1] + 2);
+    dy += 1
+  ) {
+    for (
+      let dx = Math.max(-maxShift, coarseBest[0] - 2);
+      dx <= Math.min(maxShift, coarseBest[0] + 2);
+      dx += 1
+    ) {
+      if (better([dx, dy], best)) best = [dx, dy];
+    }
+  }
+  return best;
+}
+
 export function chooseVideoRecord(
   previous: Uint8Array | null,
   current: Uint8Array,
   frameIndex: number,
   audioBytes: number,
-  keyInterval = IPVF.keyInterval,
+  options: {
+    keyInterval: number;
+    videoMode: VideoMode;
+    maxRectangles: number;
+  },
 ): VideoRecord {
-  if (!previous || (keyInterval > 0 && frameIndex % keyInterval === 0)) {
+  if (
+    !previous ||
+    (options.keyInterval > 0 && frameIndex % options.keyInterval === 0)
+  ) {
     return compressIfSmaller(RECORD_TYPE.key, 0, current, audioBytes);
   }
   const rectangle = boundingBox(previous, current);
@@ -683,7 +942,10 @@ export function chooseVideoRecord(
       ? compressIfSmaller(RECORD_TYPE.rectangles, 1, delta, audioBytes)
       : compressIfSmaller(RECORD_TYPE.key, 0, current, audioBytes);
   let selectedSectors = recordSectors(selected.payload.byteLength, audioBytes);
-  const rectangles = multiRectangleDiff(previous, current);
+  const rectangles =
+    options.videoMode === 'current'
+      ? []
+      : multiRectangleDiff(previous, current, options.maxRectangles);
   if (rectangles.length > 1) {
     const multiPayload = rectanglesPayload(current, rectangles);
     if (multiPayload.byteLength < IPVF.frameBytes) {
@@ -703,6 +965,59 @@ export function chooseVideoRecord(
       }
     }
   }
+  if (options.videoMode === 'motion' || options.videoMode === 'auto') {
+    const [dx, dy] = estimateTranslation(previous, current);
+    const prediction = translateFrame(previous, dx, dy);
+    const residual = lz4Compress(xorFrames(prediction, current));
+    const motionPayload = new Uint8Array(6 + residual.byteLength);
+    motionPayload[0] = dx & 0xff;
+    motionPayload[1] = dy & 0xff;
+    new DataView(motionPayload.buffer).setUint32(
+      2,
+      rockboxCrc32(residual),
+      true,
+    );
+    motionPayload.set(residual, 6);
+    const motionSectors = recordSectors(motionPayload.byteLength, audioBytes);
+    if (
+      (options.videoMode === 'motion' || dx !== 0 || dy !== 0) &&
+      motionPayload.byteLength < IPVF.frameBytes &&
+      motionSectors < selectedSectors
+    ) {
+      selected = {
+        kind: RECORD_TYPE.motionLz4,
+        rectangleCount: 0,
+        payload: motionPayload,
+        decodedBytes: IPVF.frameBytes,
+      };
+      selectedSectors = motionSectors;
+    }
+  }
+  if (options.videoMode === 'auto') {
+    const temporal = lz4Compress(xorFrames(previous, current));
+    const temporalPayload = new Uint8Array(4 + temporal.byteLength);
+    new DataView(temporalPayload.buffer).setUint32(
+      0,
+      rockboxCrc32(temporal),
+      true,
+    );
+    temporalPayload.set(temporal, 4);
+    const temporalSectors = recordSectors(
+      temporalPayload.byteLength,
+      audioBytes,
+    );
+    if (
+      temporalPayload.byteLength < IPVF.frameBytes &&
+      temporalSectors < selectedSectors
+    ) {
+      selected = {
+        kind: RECORD_TYPE.temporalXorLz4,
+        rectangleCount: 0,
+        payload: temporalPayload,
+        decodedBytes: IPVF.frameBytes,
+      };
+    }
+  }
   return selected;
 }
 
@@ -719,37 +1034,140 @@ export function buildRecord(
   view.setUint16(2, nextSectors, true);
   view.setUint32(4, video.payload.byteLength, true);
   view.setUint32(8, video.decodedBytes, true);
+  view.setUint32(12, audio.byteLength, true);
   bytes.set(video.payload, IPVF.recordHeaderSize);
   bytes.set(audio, IPVF.recordHeaderSize + video.payload.byteLength);
   return bytes;
 }
 
-export function buildHeader(
-  fps: number,
-  frameCount: number,
-  firstRecordSectors: number,
-) {
+export type KeyframeIndexEntry = {
+  frame: number;
+  offset: number;
+  sectors: number;
+  flags: number;
+};
+
+export function isKeyRecord(kind: RecordType) {
+  return kind === RECORD_TYPE.key || kind === RECORD_TYPE.keyLz4;
+}
+
+export function indexFlagsForKind(kind: RecordType) {
+  if (kind === RECORD_TYPE.key) return 0;
+  if (kind === RECORD_TYPE.keyLz4) return IPVF.indexKeyLz4Flag;
+  throw new Error('Only keyframes can be added to the IPVF index.');
+}
+
+export function buildIndex(entries: KeyframeIndexEntry[]) {
+  const bytes = new Uint8Array(entries.length * IPVF.indexEntrySize);
+  const view = new DataView(bytes.buffer);
+  entries.forEach((entry, index) => {
+    const offset = index * IPVF.indexEntrySize;
+    view.setUint32(offset, entry.frame, true);
+    view.setBigUint64(offset + 4, BigInt(entry.offset), true);
+    view.setUint16(offset + 12, entry.sectors, true);
+    view.setUint16(offset + 14, entry.flags, true);
+  });
+  return bytes;
+}
+
+const METADATA_TAGS = [
+  ['title', 1],
+  ['artist', 2],
+  ['album', 3],
+] as const;
+
+export function encodeMetadata(metadata: IpvfMetadata = {}) {
+  const encoder = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for (const [name, tag] of METADATA_TAGS) {
+    const value = metadata[name];
+    if (value === undefined || value === '') continue;
+    const raw = encoder.encode(value);
+    if (!raw.byteLength || raw.byteLength > 255)
+      throw new Error(`${name} metadata must be 1..255 UTF-8 bytes.`);
+    if (length + 2 + raw.byteLength > IPVF.dataOffset - IPVF.metadataOffset)
+      throw new Error('Metadata exceeds the IPVF superblock capacity.');
+    chunks.push(Uint8Array.of(tag, raw.byteLength), raw);
+    length += 2 + raw.byteLength;
+  }
+  const bytes = new Uint8Array(length);
+  let position = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, position);
+    position += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function parseMetadata(bytes: Uint8Array): IpvfMetadata {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const result: IpvfMetadata = {};
+  let position = 0;
+  while (position < bytes.byteLength) {
+    assert(
+      position + 2 <= bytes.byteLength,
+      'Metadata has a truncated TLV header.',
+    );
+    const tag = bytes[position];
+    const length = bytes[position + 1];
+    position += 2;
+    const definition = METADATA_TAGS.find((item) => item[1] === tag);
+    assert(definition && length > 0, 'Metadata contains an invalid tag.');
+    const name = definition[0];
+    assert(result[name] === undefined, `Metadata tag ${name} is duplicated.`);
+    assert(
+      position + length <= bytes.byteLength,
+      `Metadata tag ${name} exceeds its bounds.`,
+    );
+    result[name] = decoder.decode(bytes.subarray(position, position + length));
+    position += length;
+  }
+  return result;
+}
+
+export function buildHeader(options: {
+  frameRate: FrameRate;
+  frameCount: number;
+  firstRecordSectors: number;
+  flags: number;
+  mediaEndOffset: number;
+  indexCount: number;
+  indexCrc: number;
+  mediaId: number;
+  metadata?: IpvfMetadata;
+}) {
+  const rate = normalizeFrameRate(options.frameRate);
+  const metadata = encodeMetadata(options.metadata);
   const bytes = new Uint8Array(IPVF.dataOffset);
   const view = new DataView(bytes.buffer);
   bytes.set([0x49, 0x50, 0x56, 0x46], 0);
-  view.setUint16(4, IPVF.version, true);
-  view.setUint16(6, IPVF.headerSize, true);
-  view.setUint16(8, IPVF.width, true);
-  view.setUint16(10, IPVF.height, true);
-  view.setUint16(12, fps, true);
-  view.setUint16(14, 1, true);
-  view.setUint32(16, frameCount, true);
-  view.setUint32(20, IPVF.flags, true);
+  view.setUint16(4, IPVF.headerSize, true);
+  view.setUint16(6, IPVF.width, true);
+  view.setUint16(8, IPVF.height, true);
+  view.setUint16(10, rate.numerator, true);
+  view.setUint16(12, rate.denominator, true);
+  view.setUint16(14, options.firstRecordSectors, true);
+  view.setUint32(16, options.frameCount, true);
+  view.setUint32(20, options.flags, true);
   view.setUint32(24, IPVF.dataOffset, true);
-  view.setUint16(28, firstRecordSectors, true);
-  view.setUint16(30, IPVF.audioFormat, true);
-  view.setUint16(32, IPVF.audioChannels, true);
-  view.setUint16(34, IPVF.audioBitsPerSample, true);
-  view.setUint32(36, IPVF.audioSampleRate, true);
-  const audioFrames = audioBoundary(frameCount, fps);
+  view.setUint16(28, IPVF.audioFormat, true);
+  view.setUint16(30, IPVF.audioChannels, true);
+  view.setUint16(32, IPVF.audioBitsPerSample, true);
+  view.setUint32(34, IPVF.audioSampleRate, true);
+  const audioFrames = audioBoundary(options.frameCount, rate);
   if (audioFrames <= 0 || audioFrames > 0xffffffff)
     throw new Error('Audio duration exceeds IPVF limits.');
-  view.setUint32(40, audioFrames, true);
+  view.setUint32(38, audioFrames, true);
+  view.setBigUint64(44, BigInt(options.mediaEndOffset), true);
+  view.setBigUint64(52, BigInt(options.mediaEndOffset), true);
+  view.setUint32(60, options.indexCount, true);
+  view.setUint16(64, IPVF.indexEntrySize, true);
+  view.setUint16(66, metadata.byteLength, true);
+  view.setUint32(68, IPVF.metadataOffset, true);
+  view.setUint32(72, options.indexCrc, true);
+  view.setUint32(76, options.mediaId, true);
+  bytes.set(metadata, IPVF.metadataOffset);
   return bytes;
 }
 
@@ -769,13 +1187,13 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
-function rockboxCrc32(data: Uint8Array) {
+export function rockboxCrc32(data: Uint8Array, initial = 0xffffffff) {
   const table = [
     0x00000000, 0x04c11db7, 0x09823b6e, 0x0d4326d9, 0x130476dc, 0x17c56b6b,
     0x1a864db2, 0x1e475005, 0x2608edb8, 0x22c9f00f, 0x2f8ad6d6, 0x2b4bcb61,
     0x350c9b64, 0x31cd86d3, 0x3c8ea00a, 0x384fbdbd,
   ];
-  let crc = 0xffffffff;
+  let crc = initial;
   for (const byte of data) {
     let index = ((crc >>> 28) ^ (byte >>> 4)) & 0x0f;
     crc = ((crc << 4) ^ table[index]) >>> 0;
@@ -848,23 +1266,24 @@ export function validateIpvf(file: SyncRandomAccessFile): ValidationReport {
     String.fromCharCode(...header.subarray(0, 4)) === 'IPVF',
     'Missing IPVF magic.',
   );
-  assert(view.getUint16(4, true) === IPVF.version, 'Unsupported IPVF version.');
   assert(
-    view.getUint16(6, true) === IPVF.headerSize,
+    view.getUint16(4, true) === IPVF.headerSize,
     'Invalid logical header size.',
   );
   assert(
-    view.getUint16(8, true) === IPVF.width &&
-      view.getUint16(10, true) === IPVF.height,
+    view.getUint16(6, true) === IPVF.width &&
+      view.getUint16(8, true) === IPVF.height,
     'Invalid display dimensions.',
   );
-  const fps = view.getUint16(12, true);
-  const fpsDenominator = view.getUint16(14, true);
+  const fpsNumerator = view.getUint16(10, true);
+  const fpsDenominator = view.getUint16(12, true);
+  const frameRate = normalizeFrameRate({
+    numerator: fpsNumerator,
+    denominator: fpsDenominator,
+  });
+  const fps = fpsNumerator / fpsDenominator;
+  let currentSectors = view.getUint16(14, true);
   const frameCount = view.getUint32(16, true);
-  assert(
-    fpsDenominator === 1 && fps >= 4 && fps <= 240,
-    'Frame rate is outside IPVF limits.',
-  );
   assert(frameCount > 0, 'IPVF contains no frames.');
   const flags = view.getUint32(20, true);
   assert(
@@ -876,60 +1295,109 @@ export function validateIpvf(file: SyncRandomAccessFile): ValidationReport {
     view.getUint32(24, true) === IPVF.dataOffset,
     'Invalid first record offset.',
   );
-  let currentSectors = view.getUint16(28, true);
   assert(
     currentSectors > 0 && currentSectors <= IPVF.maxRecordSectors,
     'Invalid first record size.',
   );
   assert(
-    view.getUint16(30, true) === IPVF.audioFormat,
+    view.getUint16(28, true) === IPVF.audioFormat,
     'Invalid audio format.',
   );
   assert(
-    view.getUint16(32, true) === IPVF.audioChannels,
+    view.getUint16(30, true) === IPVF.audioChannels,
     'Invalid audio channel count.',
   );
   assert(
-    view.getUint16(34, true) === IPVF.audioBitsPerSample,
+    view.getUint16(32, true) === IPVF.audioBitsPerSample,
     'Invalid audio bit depth.',
   );
   assert(
-    view.getUint32(36, true) === IPVF.audioSampleRate,
+    view.getUint32(34, true) === IPVF.audioSampleRate,
     'Invalid audio sample rate.',
   );
-  const expectedAudioFrames = audioBoundary(frameCount, fps);
+  const expectedAudioFrames = audioBoundary(frameCount, frameRate);
   assert(
-    view.getUint32(40, true) === expectedAudioFrames,
+    view.getUint32(38, true) === expectedAudioFrames,
     'Header audio duration does not match the video duration.',
   );
+  assert(view.getUint16(42, true) === 0, 'Reserved header field is not zero.');
+  const mediaEnd = Number(view.getBigUint64(44, true));
+  const indexOffset = Number(view.getBigUint64(52, true));
+  const indexCount = view.getUint32(60, true);
+  const indexEntrySize = view.getUint16(64, true);
+  const metadataLength = view.getUint16(66, true);
+  const metadataOffset = view.getUint32(68, true);
+  const indexCrc = view.getUint32(72, true);
+  const expectedMediaId = view.getUint32(76, true);
+  assert(metadataOffset === IPVF.metadataOffset, 'Invalid metadata offset.');
+  const metadataEnd = metadataOffset + metadataLength;
+  assert(metadataEnd <= IPVF.dataOffset, 'Metadata exceeds the superblock.');
+  const metadata = parseMetadata(header.subarray(metadataOffset, metadataEnd));
   assert(
-    header.subarray(44).every((value) => value === 0),
-    'Header padding is not zero-filled.',
+    header.subarray(metadataEnd).every((value) => value === 0),
+    'Superblock padding is not zero-filled.',
+  );
+  assert(
+    mediaEnd > IPVF.dataOffset &&
+      mediaEnd <= fileBytes &&
+      mediaEnd % IPVF.sectorSize === 0,
+    'Invalid media end offset.',
+  );
+  assert(indexOffset === mediaEnd, 'Index does not begin at media end.');
+  assert(indexEntrySize === IPVF.indexEntrySize, 'Invalid index entry size.');
+  assert(indexCount > 0 && indexCount <= frameCount, 'Invalid index count.');
+  assert(
+    indexOffset + indexCount * indexEntrySize === fileBytes,
+    'Index bounds do not match the file end.',
   );
 
   let position = IPVF.dataOffset;
   let previous: Uint8Array | null = null;
   const counts = { keyframes: 0, rectangles: 0, repeats: 0 };
+  const audioCounts = { silence: 0, mono: 0, stereo: 0 };
+  const keyframes: KeyframeIndexEntry[] = [];
+  const recordInfo = new Map<
+    number,
+    { frame: number; kind: RecordType; sectors: number }
+  >();
+  let mediaId = 0xffffffff;
   for (let frame = 0; frame < frameCount; frame += 1) {
     assert(
       currentSectors > 0 && currentSectors <= IPVF.maxRecordSectors,
       `Frame ${frame}: invalid record size.`,
     );
     const recordBytes = currentSectors * IPVF.sectorSize;
+    assert(
+      position + recordBytes <= mediaEnd,
+      `Frame ${frame}: record exceeds media end.`,
+    );
     const record = readExactly(file, position, recordBytes);
+    mediaId = rockboxCrc32(record, mediaId);
     const recordView = new DataView(record.buffer);
     const kind = record[0] as RecordType;
     const rectangleCount = record[1];
     const nextSectors = recordView.getUint16(2, true);
     const storedBytes = recordView.getUint32(4, true);
     const decodedBytes = recordView.getUint32(8, true);
+    const audioBytes = recordView.getUint32(12, true);
     assert(
       Object.values(RECORD_TYPE).includes(kind),
       `Frame ${frame}: unknown record type.`,
     );
+    recordInfo.set(position, { frame, kind, sectors: currentSectors });
     const audioFrames =
-      audioBoundary(frame + 1, fps) - audioBoundary(frame, fps);
-    const audioBytes = imaPayloadBytes(audioFrames);
+      audioBoundary(frame + 1, frameRate) - audioBoundary(frame, frameRate);
+    const monoBytes = monoImaPayloadBytes(audioFrames);
+    const stereoBytes = stereoImaPayloadBytes(audioFrames);
+    assert(
+      audioBytes === 0 ||
+        audioBytes === monoBytes ||
+        audioBytes === stereoBytes,
+      `Frame ${frame}: invalid adaptive audio size.`,
+    );
+    if (audioBytes === 0) audioCounts.silence += 1;
+    else if (audioBytes === monoBytes) audioCounts.mono += 1;
+    else audioCounts.stereo += 1;
     const usedBytes = IPVF.recordHeaderSize + storedBytes + audioBytes;
     assert(
       Math.ceil(usedBytes / IPVF.sectorSize) === currentSectors,
@@ -962,7 +1430,8 @@ export function validateIpvf(file: SyncRandomAccessFile): ValidationReport {
     const compressed =
       kind === RECORD_TYPE.keyLz4 ||
       kind === RECORD_TYPE.rectanglesLz4 ||
-      kind === RECORD_TYPE.temporalXorLz4;
+      kind === RECORD_TYPE.temporalXorLz4 ||
+      kind === RECORD_TYPE.motionLz4;
     let payload: Uint8Array;
     if (compressed) {
       assert(
@@ -970,17 +1439,21 @@ export function validateIpvf(file: SyncRandomAccessFile): ValidationReport {
         `Frame ${frame}: invalid compressed sizes.`,
       );
       let compressedPayload = stored;
-      if (kind === RECORD_TYPE.temporalXorLz4) {
+      if (
+        kind === RECORD_TYPE.temporalXorLz4 ||
+        kind === RECORD_TYPE.motionLz4
+      ) {
+        const crcOffset = kind === RECORD_TYPE.motionLz4 ? 2 : 0;
         assert(
-          temporalEnabled && storedBytes >= 5,
+          temporalEnabled && storedBytes >= crcOffset + 5,
           `Frame ${frame}: temporal flag or size mismatch.`,
         );
         const expectedCrc = new DataView(
           stored.buffer,
           stored.byteOffset,
           stored.byteLength,
-        ).getUint32(0, true);
-        compressedPayload = stored.subarray(4);
+        ).getUint32(crcOffset, true);
+        compressedPayload = stored.subarray(crcOffset + 4);
         assert(
           rockboxCrc32(compressedPayload) === expectedCrc,
           `Frame ${frame}: temporal payload CRC mismatch.`,
@@ -1003,6 +1476,12 @@ export function validateIpvf(file: SyncRandomAccessFile): ValidationReport {
       );
       current = payload;
       counts.keyframes += 1;
+      keyframes.push({
+        frame,
+        offset: position,
+        sectors: currentSectors,
+        flags: indexFlagsForKind(kind),
+      });
     } else if (
       kind === RECORD_TYPE.rectangles ||
       kind === RECORD_TYPE.rectanglesLz4
@@ -1023,7 +1502,7 @@ export function validateIpvf(file: SyncRandomAccessFile): ValidationReport {
       );
       current = previous;
       counts.repeats += 1;
-    } else {
+    } else if (kind === RECORD_TYPE.temporalXorLz4) {
       assert(
         previous && rectangleCount === 0 && decodedBytes === IPVF.frameBytes,
         `Frame ${frame}: malformed temporal record.`,
@@ -1031,6 +1510,18 @@ export function validateIpvf(file: SyncRandomAccessFile): ValidationReport {
       current = new Uint8Array(IPVF.frameBytes);
       for (let index = 0; index < current.byteLength; index += 1)
         current[index] = previous[index] ^ payload[index];
+      counts.rectangles += 1;
+    } else {
+      assert(
+        previous && rectangleCount === 0 && decodedBytes === IPVF.frameBytes,
+        `Frame ${frame}: malformed motion record.`,
+      );
+      const prediction = translateFrame(
+        previous,
+        new DataView(stored.buffer, stored.byteOffset).getInt8(0),
+        new DataView(stored.buffer, stored.byteOffset).getInt8(1),
+      );
+      current = xorFrames(prediction, payload);
       counts.rectangles += 1;
     }
     assert(
@@ -1043,14 +1534,78 @@ export function validateIpvf(file: SyncRandomAccessFile): ValidationReport {
   }
   assert(currentSectors === 0, 'Record chain does not terminate.');
   assert(
-    position === fileBytes,
-    'Record chain does not end at the end of the file.',
+    position === mediaEnd,
+    'Record chain does not end at the media end offset.',
+  );
+  assert(mediaId === expectedMediaId, 'Media identity CRC mismatch.');
+
+  const index = readExactly(file, indexOffset, indexCount * indexEntrySize);
+  assert(rockboxCrc32(index) === indexCrc, 'Index CRC mismatch.');
+  const indexView = new DataView(index.buffer);
+  const parsedIndex: KeyframeIndexEntry[] = [];
+  let previousFrame = -1;
+  let previousOffset = IPVF.dataOffset - 1;
+  for (let entryNumber = 0; entryNumber < indexCount; entryNumber += 1) {
+    const entryOffset = entryNumber * indexEntrySize;
+    const entry = {
+      frame: indexView.getUint32(entryOffset, true),
+      offset: Number(indexView.getBigUint64(entryOffset + 4, true)),
+      sectors: indexView.getUint16(entryOffset + 12, true),
+      flags: indexView.getUint16(entryOffset + 14, true),
+    };
+    assert(
+      entryNumber !== 0 || entry.frame === 0,
+      'Index must begin at frame 0.',
+    );
+    assert(entry.frame > previousFrame, 'Index frames are not monotonic.');
+    assert(entry.offset > previousOffset, 'Index offsets are not monotonic.');
+    assert(
+      entry.offset >= IPVF.dataOffset && entry.offset % IPVF.sectorSize === 0,
+      'Index contains an invalid record offset.',
+    );
+    const info = recordInfo.get(entry.offset);
+    assert(
+      info && isKeyRecord(info.kind),
+      'Index entry is not a keyframe record.',
+    );
+    assert(
+      info.frame === entry.frame && info.sectors === entry.sectors,
+      'Index entry does not match its record.',
+    );
+    assert(
+      entry.flags === indexFlagsForKind(info.kind),
+      'Index entry has invalid keyframe flags.',
+    );
+    parsedIndex.push(entry);
+    previousFrame = entry.frame;
+    previousOffset = entry.offset;
+  }
+  assert(
+    parsedIndex.length === keyframes.length &&
+      parsedIndex.every((entry, index) => {
+        const expected = keyframes[index];
+        return (
+          entry.frame === expected.frame &&
+          entry.offset === expected.offset &&
+          entry.sectors === expected.sectors &&
+          entry.flags === expected.flags
+        );
+      }),
+    'Index does not enumerate every keyframe.',
   );
   return {
     frameCount,
     fps,
+    fpsNumerator,
+    fpsDenominator,
     audioSampleFrames: expectedAudioFrames,
     fileBytes,
+    indexCount,
+    mediaId: mediaId.toString(16).padStart(8, '0'),
+    metadata,
+    silentAudioRecords: audioCounts.silence,
+    monoAudioRecords: audioCounts.mono,
+    stereoAudioRecords: audioCounts.stereo,
     ...counts,
   };
 }

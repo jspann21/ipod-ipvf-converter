@@ -22,10 +22,12 @@ import { Button } from '@/components/ui/button';
 import { Progress, ProgressLabel } from '@/components/ui/progress';
 import type {
   ConversionStage,
+  EncoderProfile,
   FitMode,
   WorkerRequest,
   WorkerResponse,
 } from '@/src/lib/messages';
+import type { ColorDepth, FrameRate, VideoMode } from '@/src/lib/ipvf';
 
 type SourceMode = 'file' | 'url';
 type RunState = 'idle' | 'running' | 'complete' | 'error' | 'cancelled';
@@ -37,6 +39,15 @@ type ProgressState = {
   frameCount?: number;
 };
 type CompleteResult = Extract<WorkerResponse, { type: 'complete' }>;
+type FrameRatePreset =
+  | 'profile'
+  | '20/1'
+  | '24000/1001'
+  | '24/1'
+  | '25/1'
+  | '30000/1001'
+  | '30/1'
+  | '60/1';
 
 const VIDEO_FILE_PATTERN =
   /\.(?:3g2|3gp|avi|flv|m2ts|m4v|mkv|mov|mp4|mpeg|mpg|mts|ogv|ts|webm|wmv)$/i;
@@ -76,6 +87,12 @@ function isVideoFile(file: File) {
   return file.type.startsWith('video/') || VIDEO_FILE_PATTERN.test(file.name);
 }
 
+function parseFrameRate(value: FrameRatePreset): 'profile' | FrameRate {
+  if (value === 'profile') return value;
+  const [numerator, denominator] = value.split('/').map(Number);
+  return { numerator, denominator };
+}
+
 async function getOutputFile(name: string) {
   const root = await navigator.storage.getDirectory();
   const handle = await root.getFileHandle(name);
@@ -93,7 +110,16 @@ export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [fileError, setFileError] = useState('');
-  const [fps, setFps] = useState<30 | 60>(30);
+  const [profile, setProfile] = useState<EncoderProfile>('everyday');
+  const [frameRatePreset, setFrameRatePreset] =
+    useState<FrameRatePreset>('profile');
+  const [colorDepth, setColorDepth] = useState<ColorDepth>('rgb565');
+  const [videoMode, setVideoMode] = useState<'default' | VideoMode>('default');
+  const [keySeconds, setKeySeconds] = useState(5);
+  const [maxRectangles, setMaxRectangles] = useState(8);
+  const [title, setTitle] = useState('');
+  const [artist, setArtist] = useState('');
+  const [album, setAlbum] = useState('');
   const [fit, setFit] = useState<FitMode>('contain');
   const [url, setUrl] = useState('');
   const [previewSrc, setPreviewSrc] = useState('');
@@ -289,7 +315,13 @@ export default function App() {
     const message: WorkerRequest = {
       type: 'start',
       jobId,
-      fps,
+      profile,
+      frameRate: parseFrameRate(frameRatePreset),
+      colorDepth,
+      videoMode,
+      keySeconds,
+      maxRectangles,
+      metadata: { title, artist, album },
       fit,
       outputName,
       assetBase: new URL('ffmpeg/', document.baseURI).href,
@@ -696,7 +728,7 @@ export default function App() {
                             type="range"
                             min="0"
                             max={previewDuration}
-                            step={Math.max(0.01, 1 / fps)}
+                            step={0.01}
                             value={previewTime}
                             onChange={(event) => {
                               const time = Number(event.target.value);
@@ -776,35 +808,176 @@ export default function App() {
                 </div>
                 <CircleGauge className="size-5 text-[var(--mint)]" />
               </div>
-              <fieldset disabled={runState === 'running'}>
-                <legend className="mb-2 text-xs font-medium text-white/65">
-                  Frame rate
-                </legend>
-                <div className="grid grid-cols-2 gap-2">
-                  {([30, 60] as const).map((value) => (
-                    <button
-                      key={value}
-                      type="button"
-                      aria-pressed={fps === value}
-                      className="fps-choice"
-                      data-active={fps === value}
-                      onClick={() => setFps(value)}
-                    >
-                      <span className="text-lg font-semibold">{value}</span>
-                      <span className="font-mono text-[9px] uppercase tracking-[0.12em] text-white/50">
-                        fps
-                      </span>
-                    </button>
-                  ))}
+              <fieldset className="space-y-4" disabled={runState === 'running'}>
+                <div>
+                  <legend className="mb-2 text-xs font-medium text-white/65">
+                    Creator profile
+                  </legend>
+                  <div className="grid grid-cols-3 gap-2">
+                    {(['everyday', 'native', 'compact'] as const).map(
+                      (value) => (
+                        <button
+                          key={value}
+                          type="button"
+                          aria-pressed={profile === value}
+                          className="fps-choice min-w-0 px-2"
+                          data-active={profile === value}
+                          onClick={() => setProfile(value)}
+                        >
+                          <span className="truncate text-xs font-semibold capitalize">
+                            {value}
+                          </span>
+                          <span className="font-mono text-[8px] uppercase tracking-[0.08em] text-white/50">
+                            {value === 'compact' ? '20 fps' : 'source ≤30'}
+                          </span>
+                        </button>
+                      ),
+                    )}
+                  </div>
                 </div>
+
+                <label className="block text-xs font-medium text-white/65">
+                  Frame rate
+                  <select
+                    className="mt-2 h-10 w-full rounded-xl border border-white/15 bg-white/[0.08] px-3 text-xs text-white outline-none focus:border-[var(--mint)]"
+                    value={frameRatePreset}
+                    onChange={(event) => {
+                      const value = event.target.value as FrameRatePreset;
+                      setFrameRatePreset(value);
+                      if (
+                        value === '60/1' &&
+                        (videoMode === 'motion' || videoMode === 'auto')
+                      )
+                        setVideoMode('default');
+                    }}
+                  >
+                    <option value="profile">Profile default</option>
+                    <option value="20/1">20 fps</option>
+                    <option value="24000/1001">23.976 fps</option>
+                    <option value="24/1">24 fps</option>
+                    <option value="25/1">25 fps</option>
+                    <option value="30000/1001">29.97 fps</option>
+                    <option value="30/1">30 fps</option>
+                    <option value="60/1">60 fps</option>
+                  </select>
+                </label>
+
+                <label className="block text-xs font-medium text-white/65">
+                  Color quality
+                  <select
+                    className="mt-2 h-10 w-full rounded-xl border border-white/15 bg-white/[0.08] px-3 text-xs text-white outline-none focus:border-[var(--mint)]"
+                    value={colorDepth}
+                    onChange={(event) =>
+                      setColorDepth(event.target.value as ColorDepth)
+                    }
+                  >
+                    <option value="rgb565">RGB565 · full quality</option>
+                    <option value="rgb555">RGB555 · light reduction</option>
+                    <option value="rgb454">RGB454 · compact</option>
+                    <option value="rgb444">RGB444 · smallest palette</option>
+                  </select>
+                </label>
+
+                <details className="rounded-xl border border-white/10 bg-white/[0.04] p-3">
+                  <summary className="cursor-pointer text-xs font-semibold text-white/75">
+                    Advanced encoder options
+                  </summary>
+                  <div className="mt-4 space-y-3">
+                    <label className="block text-[11px] text-white/60">
+                      Video mode
+                      <select
+                        className="mt-1.5 h-9 w-full rounded-lg border border-white/15 bg-[var(--ink)] px-2.5 text-xs text-white"
+                        value={videoMode}
+                        onChange={(event) =>
+                          setVideoMode(
+                            event.target.value as 'default' | VideoMode,
+                          )
+                        }
+                      >
+                        <option value="default">Automatic</option>
+                        <option value="current">Bounds only</option>
+                        <option value="spatial">Spatial rectangles</option>
+                        <option
+                          value="motion"
+                          disabled={frameRatePreset === '60/1'}
+                        >
+                          Motion + spatial
+                        </option>
+                        <option
+                          value="auto"
+                          disabled={frameRatePreset === '60/1'}
+                        >
+                          Motion + XOR + spatial
+                        </option>
+                      </select>
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="text-[11px] text-white/60">
+                        Key interval (sec)
+                        <input
+                          className="mt-1.5 h-9 w-full rounded-lg border border-white/15 bg-[var(--ink)] px-2.5 text-xs text-white"
+                          type="number"
+                          min="0.1"
+                          step="0.1"
+                          value={keySeconds}
+                          onChange={(event) =>
+                            setKeySeconds(Number(event.target.value))
+                          }
+                        />
+                      </label>
+                      <label className="text-[11px] text-white/60">
+                        Max rectangles
+                        <input
+                          className="mt-1.5 h-9 w-full rounded-lg border border-white/15 bg-[var(--ink)] px-2.5 text-xs text-white"
+                          type="number"
+                          min="1"
+                          max="255"
+                          step="1"
+                          value={maxRectangles}
+                          onChange={(event) =>
+                            setMaxRectangles(Number(event.target.value))
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="space-y-2 border-t border-white/10 pt-3">
+                      <p className="text-[11px] text-white/60">
+                        Metadata · blank fields inherit source tags
+                      </p>
+                      {(
+                        [
+                          ['Title', title, setTitle],
+                          ['Artist', artist, setArtist],
+                          ['Album', album, setAlbum],
+                        ] as const
+                      ).map(([label, value, setter]) => (
+                        <label key={label} className="block">
+                          <span className="sr-only">{label}</span>
+                          <input
+                            className="h-9 w-full rounded-lg border border-white/15 bg-[var(--ink)] px-2.5 text-xs text-white placeholder:text-white/35"
+                            type="text"
+                            maxLength={255}
+                            placeholder={label}
+                            value={value}
+                            onChange={(event) => setter(event.target.value)}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </details>
               </fieldset>
               <div className="my-5 h-px bg-white/10" />
               <dl className="space-y-3 text-xs">
                 <div className="flex items-center justify-between gap-4">
                   <dt className="text-white/55">Display</dt>
                   <dd className="font-mono text-[11px]">
-                    220 × 176 · RGB565BE
+                    220 × 176 · {colorDepth.toUpperCase()}BE
                   </dd>
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <dt className="text-white/55">Compression</dt>
+                  <dd className="font-mono text-[11px]">built-in LZ4</dd>
                 </div>
                 <div className="flex items-center justify-between gap-4">
                   <dt className="text-white/55">Framing</dt>
@@ -821,7 +994,7 @@ export default function App() {
                 <div className="flex items-center justify-between gap-4">
                   <dt className="text-white/55">Audio</dt>
                   <dd className="font-mono text-[11px]">
-                    44.1 kHz · stereo IMA ADPCM
+                    44.1 kHz · adaptive IMA ADPCM
                   </dd>
                 </div>
                 <div className="flex items-center justify-between gap-4">
@@ -859,7 +1032,10 @@ export default function App() {
                     </h3>
                     <p className="mt-1 text-xs leading-5 text-[var(--muted-ink)]">
                       {result.report.frameCount.toLocaleString()} frames ·{' '}
-                      {formatBytes(result.report.fileBytes)} · {result.engine}
+                      {result.report.fpsNumerator}/
+                      {result.report.fpsDenominator} fps ·{' '}
+                      {formatBytes(result.report.fileBytes)} ·{' '}
+                      {result.report.indexCount} indexed keys · {result.engine}
                     </p>
                   </div>
                 </div>
@@ -888,9 +1064,9 @@ export default function App() {
                       Validated before download
                     </h3>
                     <p className="mt-1 text-xs leading-5 text-[var(--muted-ink)]">
-                      Every header, record link, rectangle, audio slice, and
-                      sector boundary is checked against the Rockbox player
-                      contract.
+                      Header, metadata, record links, reconstructed video,
+                      adaptive audio, sector padding, media identity, and the
+                      keyframe index are checked against the Rockbox contract.
                     </p>
                   </div>
                 </div>

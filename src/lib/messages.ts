@@ -1,16 +1,30 @@
-import type { ValidationReport } from './ipvf';
+import type {
+  ColorDepth,
+  FrameRate,
+  IpvfMetadata,
+  ValidationReport,
+  VideoMode,
+} from './ipvf';
 
 export type ConversionSource =
   | { kind: 'file'; file: File }
   | { kind: 'url'; url: string };
 
 export type FitMode = 'contain' | 'cover' | 'fill';
+export type EncoderProfile = 'everyday' | 'native' | 'compact';
+export type FrameRateSetting = 'profile' | FrameRate;
 
 export type StartConversionMessage = {
   type: 'start';
   jobId: string;
   source: ConversionSource;
-  fps: 30 | 60;
+  profile: EncoderProfile;
+  frameRate: FrameRateSetting;
+  colorDepth: ColorDepth;
+  videoMode: 'default' | VideoMode;
+  keySeconds: number;
+  maxRectangles: number;
+  metadata: IpvfMetadata;
   fit: FitMode;
   outputName: string;
   assetBase: string;
