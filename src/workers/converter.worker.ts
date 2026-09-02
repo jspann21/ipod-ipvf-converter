@@ -8,6 +8,9 @@ import {
   UrlSource,
   VideoSampleSink,
   type AudioSample,
+  type InputAudioTrack,
+  type InputVideoTrack,
+  type VideoSample,
 } from 'mediabunny';
 import { FFmpeg, FFFSType } from '@ffmpeg/ffmpeg';
 
@@ -182,6 +185,35 @@ async function sourceBlob(message: StartConversionMessage) {
   return response.blob();
 }
 
+async function confirmsVideoDecode(track: InputVideoTrack) {
+  try {
+    const timestamp = await track.getFirstTimestamp();
+    const sink = new VideoSampleSink(track);
+    for await (const sample of sink.samplesAtTimestamps([timestamp])) {
+      if (!sample) return false;
+      sample.close();
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+async function confirmsAudioDecode(track: InputAudioTrack) {
+  try {
+    const timestamp = await track.getFirstTimestamp();
+    const sink = new AudioSampleSink(track);
+    for await (const sample of sink.samples(timestamp, timestamp + 1)) {
+      sample.close();
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 async function normalizeWithFfmpeg(
   jobId: string,
   blob: Blob,
@@ -221,33 +253,37 @@ async function normalizeWithFfmpeg(
     '0:v:0',
     '-map',
     '0:a:0?',
+    '-vf',
+    'scale=220:176:force_original_aspect_ratio=decrease:force_divisible_by=2',
     '-c:v',
-    'libx264',
-    '-preset',
-    'ultrafast',
+    'libvpx',
+    '-deadline',
+    'realtime',
+    '-cpu-used',
+    '8',
     '-crf',
-    '18',
+    '10',
+    '-b:v',
+    '0',
     '-pix_fmt',
     'yuv420p',
     '-fps_mode:v',
-    'passthrough',
+    'vfr',
     '-c:a',
-    'aac',
+    'libopus',
     '-b:a',
-    '192k',
-    '-movflags',
-    '+faststart',
-    'normalized.mp4',
+    '128k',
+    'normalized.webm',
   ]);
   assertActive(jobId);
   if (exitCode !== 0)
     throw new Error(
       `The software compatibility decoder exited with status ${exitCode}.`,
     );
-  const data = await ffmpeg.readFile('normalized.mp4');
+  const data = await ffmpeg.readFile('normalized.webm');
   if (typeof data === 'string')
     throw new Error('The compatibility decoder returned invalid media data.');
-  const normalized = new Blob([new Uint8Array(data)], { type: 'video/mp4' });
+  const normalized = new Blob([new Uint8Array(data)], { type: 'video/webm' });
   ffmpeg.terminate();
   activeFfmpeg = null;
   progress(
@@ -467,20 +503,36 @@ async function writeVideoRecords(
   )
     throw new Error('Maximum rectangles must be between 1 and 255.');
 
-  const samples = sink.samplesAtTimestamps(
-    timestamps(videoStart, frameCount, frameRate),
-  );
-  for await (const sample of samples) {
-    assertActive(jobId);
-    if (!sample)
-      throw new Error(
-        `The video decoder did not return frame ${frameIndex + 1}.`,
-      );
+  const sourceSamples = sink.samples()[Symbol.asyncIterator]();
+  let currentSample: VideoSample | null = null;
+  let nextSample = await sourceSamples.next();
+  try {
+    for (const targetTimestamp of timestamps(
+      videoStart,
+      frameCount,
+      frameRate,
+    )) {
+      assertActive(jobId);
+      while (
+        !nextSample.done &&
+        nextSample.value.timestamp <= targetTimestamp + 1e-9
+      ) {
+        currentSample?.close();
+        currentSample = nextSample.value;
+        nextSample = await sourceSamples.next();
+      }
+      if (!currentSample && !nextSample.done) {
+        currentSample = nextSample.value;
+        nextSample = await sourceSamples.next();
+      }
+      if (!currentSample)
+        throw new Error(
+          `The video decoder did not return frame ${frameIndex + 1}.`,
+        );
 
-    try {
       context.fillStyle = '#000';
       context.fillRect(0, 0, IPVF.width, IPVF.height);
-      sample.drawWithFit(context, { fit: message.fit });
+      currentSample.drawWithFit(context, { fit: message.fit });
       const rgba = context.getImageData(0, 0, IPVF.width, IPVF.height).data;
       const currentFrame = rgbaToRgb565be(rgba, message.colorDepth);
       const audioStart = audioBoundary(frameIndex, frameRate);
@@ -557,9 +609,11 @@ async function writeVideoRecords(
         );
         await yieldToMessages(jobId);
       }
-    } finally {
-      sample.close();
     }
+  } finally {
+    currentSample?.close();
+    if (!nextSample.done) nextSample.value.close();
+    await sourceSamples.return?.();
   }
 
   if (!pending || frameIndex !== frameCount) {
@@ -646,47 +700,27 @@ async function convert(message: StartConversionMessage) {
     if (!videoTrack)
       throw new Error('The selected source does not contain a video track.');
 
-    progress(
-      jobId,
-      'inspect',
-      0.2,
-      message.frameRate === 'profile'
-        ? 'Analyzing the complete source cadence'
-        : 'Reading source metadata',
-    );
-    const [packetStats, inputMetadata] = await Promise.all([
-      message.frameRate === 'profile'
-        ? videoTrack.computePacketStats().catch(() => {
-            throw new Error(
-              'Could not analyze the complete source cadence. Choose an explicit frame rate and try again.',
-            );
-          })
-        : Promise.resolve(null),
-      input.getMetadataTags().catch(() => ({})),
-    ]);
-    if (
-      message.frameRate === 'profile' &&
-      (!packetStats ||
-        !Number.isFinite(packetStats.averagePacketRate) ||
-        packetStats.averagePacketRate <= 0)
-    )
-      throw new Error(
-        'The source cadence is unavailable. Choose an explicit frame rate and try again.',
-      );
-    const frameRate = resolveFrameRate(
-      message,
-      packetStats?.averagePacketRate ?? 30,
-    );
-    const metadata = sourceMetadata(inputMetadata, message.metadata);
-
-    let videoCanDecode = await videoTrack.canDecode();
-    let audioCanDecode = audioTrack ? await audioTrack.canDecode() : true;
+    progress(jobId, 'inspect', 0.2, 'Checking browser decoder support');
+    const inputMetadata = await input.getMetadataTags().catch(() => ({}));
+    let videoCanDecode = false;
+    let audioCanDecode = !audioTrack;
     let videoCodec = await videoTrack.getCodecParameterString();
     let audioCodec = audioTrack
       ? await audioTrack.getCodecParameterString()
       : null;
     sourceVideoCodec = videoCodec ?? 'unknown';
     sourceAudioCodec = audioTrack ? (audioCodec ?? 'unknown') : 'none';
+    progress(jobId, 'inspect', 0.28, 'Confirming browser decoder support');
+    [videoCanDecode, audioCanDecode] = await Promise.all([
+      videoTrack.canDecode(),
+      audioTrack ? audioTrack.canDecode() : Promise.resolve(true),
+    ]);
+    [videoCanDecode, audioCanDecode] = await Promise.all([
+      videoCanDecode ? confirmsVideoDecode(videoTrack) : Promise.resolve(false),
+      audioTrack && audioCanDecode
+        ? confirmsAudioDecode(audioTrack)
+        : Promise.resolve(audioCanDecode),
+    ]);
     if (!videoCanDecode || !audioCanDecode) {
       const blob = await sourceBlob(message);
       const normalized = await normalizeWithFfmpeg(
@@ -717,8 +751,47 @@ async function convert(message: StartConversionMessage) {
           'This browser cannot decode the compatibility output. Try a current Chromium browser.',
         );
       }
+      [videoCanDecode, audioCanDecode] = await Promise.all([
+        confirmsVideoDecode(videoTrack),
+        audioTrack ? confirmsAudioDecode(audioTrack) : Promise.resolve(true),
+      ]);
+      if (!videoCanDecode || !audioCanDecode)
+        throw new Error(
+          'The browser could not decode the normalized compatibility output. Try a current Chromium browser.',
+        );
       engine = 'ffmpeg.wasm → WebCodecs';
     }
+
+    progress(
+      jobId,
+      'inspect',
+      0.85,
+      message.frameRate === 'profile'
+        ? 'Analyzing the complete source cadence'
+        : 'Reading source timing',
+    );
+    const packetStats =
+      message.frameRate === 'profile'
+        ? await videoTrack.computePacketStats().catch(() => {
+            throw new Error(
+              'Could not analyze the complete source cadence. Choose an explicit frame rate and try again.',
+            );
+          })
+        : null;
+    if (
+      message.frameRate === 'profile' &&
+      (!packetStats ||
+        !Number.isFinite(packetStats.averagePacketRate) ||
+        packetStats.averagePacketRate <= 0)
+    )
+      throw new Error(
+        'The source cadence is unavailable. Choose an explicit frame rate and try again.',
+      );
+    const frameRate = resolveFrameRate(
+      message,
+      packetStats?.averagePacketRate ?? 30,
+    );
+    const metadata = sourceMetadata(inputMetadata, message.metadata);
 
     const [videoStart, videoEnd] = await Promise.all([
       videoTrack.getFirstTimestamp(),

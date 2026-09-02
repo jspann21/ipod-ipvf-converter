@@ -646,13 +646,7 @@ export default function App() {
                           )
                             ? event.currentTarget.duration
                             : 0;
-                          const time =
-                            duration > 0
-                              ? Math.min(
-                                  Math.max(duration * 0.25, 0),
-                                  Math.max(0, duration - 0.01),
-                                )
-                              : 0;
+                          const time = 0;
                           setPreviewDuration(duration);
                           setPreviewTime(time);
                           event.currentTarget.currentTime = time;
@@ -674,46 +668,30 @@ export default function App() {
 
                     <div>
                       <fieldset disabled={runState === 'running'}>
-                        <legend className="mb-2 text-xs font-semibold">
+                        <label
+                          className="block text-xs font-semibold"
+                          htmlFor="framing-mode"
+                        >
                           Framing
-                        </legend>
-                        <div className="space-y-2">
-                          {(
-                            [
-                              [
-                                'contain',
-                                'Letterbox',
-                                'Keep the whole frame; add black bars',
-                              ],
-                              [
-                                'cover',
-                                'Crop to fill',
-                                'Fill the display; trim the outer edges',
-                              ],
-                              [
-                                'fill',
-                                'Stretch to fill',
-                                'Use every pixel; aspect ratio may change',
-                              ],
-                            ] as const
-                          ).map(([value, label, description]) => (
-                            <button
-                              key={value}
-                              type="button"
-                              aria-pressed={fit === value}
-                              data-active={fit === value}
-                              className="fit-choice"
-                              onClick={() => setFit(value)}
-                            >
-                              <span className="block text-xs font-semibold">
-                                {label}
-                              </span>
-                              <span className="mt-0.5 block text-[10px] leading-4 text-[var(--muted-ink)]">
-                                {description}
-                              </span>
-                            </button>
-                          ))}
-                        </div>
+                        </label>
+                        <select
+                          id="framing-mode"
+                          className="ipvf-select ipvf-select-light mt-2 h-10 w-full rounded-xl border border-[var(--line-strong)] px-3 text-xs outline-none focus:border-[var(--teal)] focus:ring-3 focus:ring-[var(--teal-soft)]"
+                          value={fit}
+                          onChange={(event) =>
+                            setFit(event.target.value as FitMode)
+                          }
+                        >
+                          <option value="contain">
+                            Letterbox — keep the whole frame
+                          </option>
+                          <option value="cover">
+                            Crop to fill — trim outer edges
+                          </option>
+                          <option value="fill">
+                            Stretch to fill — use every pixel
+                          </option>
+                        </select>
                       </fieldset>
 
                       {previewDuration > 0 && (
@@ -810,36 +788,34 @@ export default function App() {
               </div>
               <fieldset className="space-y-4" disabled={runState === 'running'}>
                 <div>
-                  <legend className="mb-2 text-xs font-medium text-white/65">
+                  <label
+                    className="mb-2 block text-xs font-medium text-white/65"
+                    htmlFor="creator-profile"
+                  >
                     Creator profile
-                  </legend>
-                  <div className="grid grid-cols-3 gap-2">
-                    {(['everyday', 'native', 'compact'] as const).map(
-                      (value) => (
-                        <button
-                          key={value}
-                          type="button"
-                          aria-pressed={profile === value}
-                          className="fps-choice min-w-0 px-2"
-                          data-active={profile === value}
-                          onClick={() => setProfile(value)}
-                        >
-                          <span className="truncate text-xs font-semibold capitalize">
-                            {value}
-                          </span>
-                          <span className="font-mono text-[8px] uppercase tracking-[0.08em] text-white/50">
-                            {value === 'compact' ? '20 fps' : 'source ≤30'}
-                          </span>
-                        </button>
-                      ),
-                    )}
-                  </div>
+                  </label>
+                  <select
+                    id="creator-profile"
+                    className="ipvf-select ipvf-select-dark h-10 w-full rounded-xl border border-white/15 px-3 text-xs outline-none focus:border-[var(--mint)]"
+                    value={profile}
+                    onChange={(event) =>
+                      setProfile(event.target.value as EncoderProfile)
+                    }
+                  >
+                    <option value="everyday">
+                      Everyday — source cadence up to 30 fps
+                    </option>
+                    <option value="native">
+                      Native — full RGB565 precision
+                    </option>
+                    <option value="compact">Compact — fixed 20 fps</option>
+                  </select>
                 </div>
 
                 <label className="block text-xs font-medium text-white/65">
                   Frame rate
                   <select
-                    className="mt-2 h-10 w-full rounded-xl border border-white/15 bg-white/[0.08] px-3 text-xs text-white outline-none focus:border-[var(--mint)]"
+                    className="ipvf-select ipvf-select-dark mt-2 h-10 w-full rounded-xl border border-white/15 px-3 text-xs outline-none focus:border-[var(--mint)]"
                     value={frameRatePreset}
                     onChange={(event) => {
                       const value = event.target.value as FrameRatePreset;
@@ -865,7 +841,7 @@ export default function App() {
                 <label className="block text-xs font-medium text-white/65">
                   Color quality
                   <select
-                    className="mt-2 h-10 w-full rounded-xl border border-white/15 bg-white/[0.08] px-3 text-xs text-white outline-none focus:border-[var(--mint)]"
+                    className="ipvf-select ipvf-select-dark mt-2 h-10 w-full rounded-xl border border-white/15 px-3 text-xs outline-none focus:border-[var(--mint)]"
                     value={colorDepth}
                     onChange={(event) =>
                       setColorDepth(event.target.value as ColorDepth)
@@ -886,7 +862,7 @@ export default function App() {
                     <label className="block text-[11px] text-white/60">
                       Video mode
                       <select
-                        className="mt-1.5 h-9 w-full rounded-lg border border-white/15 bg-[var(--ink)] px-2.5 text-xs text-white"
+                        className="ipvf-select ipvf-select-dark mt-1.5 h-9 w-full rounded-lg border border-white/15 px-2.5 text-xs"
                         value={videoMode}
                         onChange={(event) =>
                           setVideoMode(
