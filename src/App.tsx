@@ -224,7 +224,7 @@ export default function App() {
           setRunProgress({
             stage: 'done',
             progress: 1,
-            detail: 'Canonical validation passed',
+            detail: 'IPVF structural validation passed',
           });
         } else if (message.type === 'cancelled') {
           setRunState('cancelled');

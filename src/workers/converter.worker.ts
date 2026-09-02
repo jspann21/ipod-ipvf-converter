@@ -97,29 +97,81 @@ function copyPlane(sample: AudioSample, channel: number) {
   return plane;
 }
 
-function resampleToStereoS16(sample: AudioSample) {
-  const sourceFrames = sample.numberOfFrames;
-  if (!sourceFrames) return new Uint8Array(0);
+type AudioBlock = {
+  timestamp: number;
+  duration: number;
+  sampleRate: number;
+  left: Float32Array;
+  right: Float32Array;
+};
+
+function copyAudioBlock(sample: AudioSample): AudioBlock {
   const left = copyPlane(sample, 0);
-  const right = sample.numberOfChannels > 1 ? copyPlane(sample, 1) : left;
-  const targetFrames = Math.max(
-    1,
-    Math.round((sourceFrames * IPVF.audioSampleRate) / sample.sampleRate),
+  return {
+    timestamp: sample.timestamp,
+    duration: sample.duration,
+    sampleRate: sample.sampleRate,
+    left,
+    right: sample.numberOfChannels > 1 ? copyPlane(sample, 1) : left,
+  };
+}
+
+function resampleAudioBlock(
+  block: AudioBlock,
+  next: AudioBlock | null,
+  videoStart: number,
+  videoEnd: number,
+  targetAudioFrames: number,
+  writtenUntil: number,
+) {
+  const expectedNextTimestamp = block.timestamp + block.duration;
+  const nextIsContiguous =
+    next !== null &&
+    next.left.length > 0 &&
+    Math.abs(next.timestamp - expectedNextTimestamp) <=
+      1.5 / Math.min(block.sampleRate, next.sampleRate);
+  const blockEnd = Math.min(
+    videoEnd,
+    nextIsContiguous ? next.timestamp : expectedNextTimestamp,
   );
-  const output = new Uint8Array(targetFrames * IPVF.audioFrameBytes);
+  const targetStart = Math.max(
+    writtenUntil,
+    0,
+    Math.round((block.timestamp - videoStart) * IPVF.audioSampleRate),
+  );
+  const targetEnd = Math.min(
+    targetAudioFrames,
+    Math.round((blockEnd - videoStart) * IPVF.audioSampleRate),
+  );
+  if (!block.left.length || targetEnd <= targetStart)
+    return { bytes: new Uint8Array(), targetStart, targetEnd };
+
+  const output = new Uint8Array(
+    (targetEnd - targetStart) * IPVF.audioFrameBytes,
+  );
   const view = new DataView(output.buffer);
 
-  for (let frame = 0; frame < targetFrames; frame += 1) {
-    const sourcePosition = (frame * sample.sampleRate) / IPVF.audioSampleRate;
-    const first = Math.min(sourceFrames - 1, Math.floor(sourcePosition));
-    const second = Math.min(sourceFrames - 1, first + 1);
-    const mix = sourcePosition - first;
-    const l = left[first] + (left[second] - left[first]) * mix;
-    const r = right[first] + (right[second] - right[first]) * mix;
-    view.setInt16(frame * 4, floatToInt16(l), true);
-    view.setInt16(frame * 4 + 2, floatToInt16(r), true);
+  for (let target = targetStart; target < targetEnd; target += 1) {
+    const outputTime = videoStart + target / IPVF.audioSampleRate;
+    const sourcePosition = Math.max(
+      0,
+      (outputTime - block.timestamp) * block.sampleRate,
+    );
+    const first = Math.min(block.left.length - 1, Math.floor(sourcePosition));
+    const mix = Math.max(0, Math.min(1, sourcePosition - first));
+    let nextLeft = block.left[Math.min(first + 1, block.left.length - 1)];
+    let nextRight = block.right[Math.min(first + 1, block.right.length - 1)];
+    if (first + 1 >= block.left.length && nextIsContiguous) {
+      nextLeft = next.left[0];
+      nextRight = next.right[0];
+    }
+    const left = block.left[first] + (nextLeft - block.left[first]) * mix;
+    const right = block.right[first] + (nextRight - block.right[first]) * mix;
+    const outputOffset = (target - targetStart) * IPVF.audioFrameBytes;
+    view.setInt16(outputOffset, floatToInt16(left), true);
+    view.setInt16(outputOffset + 2, floatToInt16(right), true);
   }
-  return output;
+  return { bytes: output, targetStart, targetEnd };
 }
 
 async function sourceBlob(message: StartConversionMessage) {
@@ -177,6 +229,8 @@ async function normalizeWithFfmpeg(
     '18',
     '-pix_fmt',
     'yuv420p',
+    '-fps_mode:v',
+    'passthrough',
     '-c:a',
     'aac',
     '-b:a',
@@ -216,6 +270,26 @@ async function decodeAudio(
   audioFile.truncate(targetAudioFrames * IPVF.audioFrameBytes);
   let decodedSamples = 0;
   let writtenFrames = 0;
+  let writtenUntil = 0;
+  let pending: AudioBlock | null = null;
+
+  const writeBlock = (block: AudioBlock, next: AudioBlock | null) => {
+    const resampled = resampleAudioBlock(
+      block,
+      next,
+      videoStart,
+      videoEnd,
+      targetAudioFrames,
+      writtenUntil,
+    );
+    if (resampled.bytes.byteLength) {
+      audioFile.write(resampled.bytes, {
+        at: resampled.targetStart * IPVF.audioFrameBytes,
+      });
+      writtenFrames += resampled.bytes.byteLength / IPVF.audioFrameBytes;
+    }
+    writtenUntil = Math.max(writtenUntil, resampled.targetEnd);
+  };
 
   for await (const sample of sink.samples(undefined, videoEnd)) {
     assertActive(jobId);
@@ -223,35 +297,9 @@ async function decodeAudio(
       const sampleEnd = sample.timestamp + sample.duration;
       if (sampleEnd <= videoStart) continue;
       if (sample.timestamp >= videoEnd) break;
-
-      const pcm = resampleToStereoS16(sample);
-      let targetStart = Math.round(
-        (sample.timestamp - videoStart) * IPVF.audioSampleRate,
-      );
-      let sourceByteOffset = 0;
-      if (targetStart < 0) {
-        sourceByteOffset = Math.min(
-          pcm.byteLength,
-          -targetStart * IPVF.audioFrameBytes,
-        );
-        targetStart = 0;
-      }
-
-      const availableFrames = Math.floor(
-        (pcm.byteLength - sourceByteOffset) / IPVF.audioFrameBytes,
-      );
-      const framesToWrite = Math.max(
-        0,
-        Math.min(availableFrames, targetAudioFrames - targetStart),
-      );
-      if (framesToWrite > 0) {
-        const bytes = pcm.subarray(
-          sourceByteOffset,
-          sourceByteOffset + framesToWrite * IPVF.audioFrameBytes,
-        );
-        audioFile.write(bytes, { at: targetStart * IPVF.audioFrameBytes });
-        writtenFrames += framesToWrite;
-      }
+      const current = copyAudioBlock(sample);
+      if (pending) writeBlock(pending, current);
+      pending = current;
       decodedSamples += 1;
 
       if ((decodedSamples & 31) === 0) {
@@ -271,6 +319,8 @@ async function decodeAudio(
       sample.close();
     }
   }
+
+  if (pending) writeBlock(pending, null);
 
   audioFile.flush();
   progress(
@@ -311,16 +361,30 @@ function approximateFrameRate(value: number): FrameRate {
     { numerator: 60, denominator: 1 },
   ];
   const common = commonRates.find(
-    (rate) => Math.abs(value - rate.numerator / rate.denominator) < 0.02,
+    (rate) => Math.abs(value - rate.numerator / rate.denominator) < 0.001,
   );
   if (common) return common;
-  let numerator = Math.round(value * 1_000);
-  let denominator = 1_000;
+  let numerator = Math.round(value);
+  let denominator = 1;
+  let bestError = Math.abs(value - numerator);
+  const maximumDenominator = Math.min(0xffff, Math.floor(0xffff / value));
+  for (
+    let candidateDenominator = 2;
+    candidateDenominator <= maximumDenominator;
+    candidateDenominator += 1
+  ) {
+    const candidateNumerator = Math.round(value * candidateDenominator);
+    const error = Math.abs(value - candidateNumerator / candidateDenominator);
+    if (error < bestError) {
+      numerator = candidateNumerator;
+      denominator = candidateDenominator;
+      bestError = error;
+      if (error === 0) break;
+    }
+  }
   const divisor = greatestCommonDivisor(numerator, denominator);
   numerator /= divisor;
   denominator /= divisor;
-  if (numerator > 0xffff || denominator > 0xffff)
-    return { numerator: Math.round(value), denominator: 1 };
   return { numerator, denominator };
 }
 
@@ -582,10 +646,33 @@ async function convert(message: StartConversionMessage) {
     if (!videoTrack)
       throw new Error('The selected source does not contain a video track.');
 
+    progress(
+      jobId,
+      'inspect',
+      0.2,
+      message.frameRate === 'profile'
+        ? 'Analyzing the complete source cadence'
+        : 'Reading source metadata',
+    );
     const [packetStats, inputMetadata] = await Promise.all([
-      videoTrack.computePacketStats(120).catch(() => null),
+      message.frameRate === 'profile'
+        ? videoTrack.computePacketStats().catch(() => {
+            throw new Error(
+              'Could not analyze the complete source cadence. Choose an explicit frame rate and try again.',
+            );
+          })
+        : Promise.resolve(null),
       input.getMetadataTags().catch(() => ({})),
     ]);
+    if (
+      message.frameRate === 'profile' &&
+      (!packetStats ||
+        !Number.isFinite(packetStats.averagePacketRate) ||
+        packetStats.averagePacketRate <= 0)
+    )
+      throw new Error(
+        'The source cadence is unavailable. Choose an explicit frame rate and try again.',
+      );
     const frameRate = resolveFrameRate(
       message,
       packetStats?.averagePacketRate ?? 30,
@@ -697,7 +784,7 @@ async function convert(message: StartConversionMessage) {
       'Checking the complete header and sector chain',
     );
     const report = validateIpvf(outputFile);
-    progress(jobId, 'validate', 1, 'Canonical validation passed');
+    progress(jobId, 'validate', 1, 'IPVF structural validation passed');
     respond({
       type: 'complete',
       jobId,

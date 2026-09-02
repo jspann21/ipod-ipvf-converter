@@ -25,12 +25,12 @@ Every generated file is validated before download. Validation checks the header,
 
 The UI and conversion pipeline are static files suitable for GitHub Pages.
 
-1. [Mediabunny](https://mediabunny.dev/) demuxes the local file or direct URL with bounded read caches.
+1. [Mediabunny](https://mediabunny.dev/) demuxes the local file or direct URL with bounded read caches and analyzes the complete packet timeline before resolving the profile's source cadence.
 2. WebCodecs decodes video and audio in a dedicated worker when the browser supports the source codecs.
-3. If the container is readable but its codecs are not, the single-threaded [ffmpeg.wasm](https://ffmpegwasm.netlify.app/) compatibility path normalizes it to H.264/AAC, then returns to the same canonical IPVF path.
+3. If the container is readable but its codecs are not, the single-threaded [ffmpeg.wasm](https://ffmpegwasm.netlify.app/) compatibility path normalizes it to H.264/AAC while preserving video timestamps, then returns to the same canonical IPVF path.
 4. A browser video canvas shows a seekable still preview at the exact 220×176 output ratio. The selected letterbox (`contain`), crop-to-fill (`cover`), or stretch-to-fill (`fill`) mode is passed to the worker.
 5. An `OffscreenCanvas` applies that framing and the chosen host color cleanup to every requested output frame. Pixels are packed as RGB565BE.
-6. Decoded audio is resampled and written into an OPFS temporary file at its media timestamps. Sources without audio and uncovered time become silence; excess audio is trimmed to the video duration. Each record selects silence, mono, or stereo anchored IMA ADPCM.
+6. Decoded audio is resampled on one absolute 44.1 kHz timeline with interpolation carried across adjacent decoder blocks, then written into an OPFS temporary file. Sources without audio and uncovered time become silence; excess audio is trimmed to the video duration. Each record selects silence, mono, or stereo anchored IMA ADPCM.
 7. IPVF records are incrementally written to OPFS. The encoder evaluates raw/LZ4 keys, repeats, bounded spatial rectangles, translated motion residuals, and optional full-frame XOR candidates using final sector cost. The browser uses the deterministic built-in LZ4 implementation; host-library LZ4 modes from the Python CLI are not applicable in a static browser build.
 8. The validator re-reads the finished file from OPFS. Download uses a file-backed `Blob`; “Save as” streams directly to a user-selected destination when the File System Access API is available.
 
