@@ -401,9 +401,11 @@ function lz4Key(data: Uint8Array, position: number) {
   );
 }
 
-export function lz4Compress(data: Uint8Array) {
+export function lz4Compress(data: Uint8Array, maxCandidates = 32) {
   const length = data.byteLength;
   if (!length) throw new Error('Cannot encode an empty LZ4 block.');
+  if (!Number.isInteger(maxCandidates) || maxCandidates < 1)
+    throw new Error('LZ4 search depth must be a positive integer.');
   const previous = new Int32Array(length);
   previous.fill(-1);
   const heads = new Map<number, number>();
@@ -435,7 +437,7 @@ export function lz4Compress(data: Uint8Array) {
     let friendlyLength = 0;
     let friendlyReference = -1;
     let candidates = 0;
-    while (reference >= 0 && candidates < 32) {
+    while (reference >= 0 && candidates < maxCandidates) {
       const offset = at - reference;
       if (offset > 65535) break;
       if (
@@ -794,7 +796,14 @@ function compressIfSmaller(
   payload: Uint8Array,
   audioBytes: number,
 ): VideoRecord {
-  const compressed = lz4Compress(payload);
+  // The reference creator's balanced mode uses LZ4HC-12 when available.
+  // Browser builds do not have liblz4, so spend extra host-side search only on
+  // full keys. This preserves the same raw LZ4 bitstream while reducing the
+  // five-second keyframe I/O/decode spike on the iPod.
+  const compressed = lz4Compress(
+    payload,
+    kind === RECORD_TYPE.key ? 256 : 32,
+  );
   if (
     compressed.byteLength < payload.byteLength &&
     recordSectors(compressed.byteLength, audioBytes) <
