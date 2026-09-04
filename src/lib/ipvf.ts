@@ -32,6 +32,8 @@ export const RECORD_TYPE = {
   motionLz4: 6,
 } as const;
 
+export const MOTION_MIN_SECTOR_SAVING = 10;
+
 export type RecordType = (typeof RECORD_TYPE)[keyof typeof RECORD_TYPE];
 
 export type VideoRecord = {
@@ -47,7 +49,7 @@ export type FrameRate = {
 };
 
 export type ColorDepth = 'rgb565' | 'rgb555' | 'rgb454' | 'rgb444';
-export type VideoMode = 'current' | 'spatial' | 'motion' | 'auto';
+export type VideoMode = 'current' | 'spatial' | 'balanced' | 'motion' | 'auto';
 export type IpvfMetadata = {
   title?: string;
   artist?: string;
@@ -800,10 +802,7 @@ function compressIfSmaller(
   // Browser builds do not have liblz4, so spend extra host-side search only on
   // full keys. This preserves the same raw LZ4 bitstream while reducing the
   // five-second keyframe I/O/decode spike on the iPod.
-  const compressed = lz4Compress(
-    payload,
-    kind === RECORD_TYPE.key ? 256 : 32,
-  );
+  const compressed = lz4Compress(payload, kind === RECORD_TYPE.key ? 256 : 32);
   if (
     compressed.byteLength < payload.byteLength &&
     recordSectors(compressed.byteLength, audioBytes) <
@@ -974,7 +973,11 @@ export function chooseVideoRecord(
       }
     }
   }
-  if (options.videoMode === 'motion' || options.videoMode === 'auto') {
+  if (
+    options.videoMode === 'balanced' ||
+    options.videoMode === 'motion' ||
+    options.videoMode === 'auto'
+  ) {
     const [dx, dy] = estimateTranslation(previous, current);
     const prediction = translateFrame(previous, dx, dy);
     const residual = lz4Compress(xorFrames(prediction, current));
@@ -988,10 +991,14 @@ export function chooseVideoRecord(
     );
     motionPayload.set(residual, 6);
     const motionSectors = recordSectors(motionPayload.byteLength, audioBytes);
+    const savesEnoughSectors =
+      options.videoMode === 'balanced'
+        ? motionSectors + MOTION_MIN_SECTOR_SAVING <= selectedSectors
+        : motionSectors < selectedSectors;
     if (
-      (options.videoMode === 'motion' || dx !== 0 || dy !== 0) &&
+      (options.videoMode !== 'auto' || dx !== 0 || dy !== 0) &&
       motionPayload.byteLength < IPVF.frameBytes &&
-      motionSectors < selectedSectors
+      savesEnoughSectors
     ) {
       selected = {
         kind: RECORD_TYPE.motionLz4,

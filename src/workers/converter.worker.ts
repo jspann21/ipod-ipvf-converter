@@ -489,7 +489,7 @@ async function writeVideoRecords(
   const videoMode =
     message.videoMode === 'default'
       ? rateValue <= 30
-        ? 'motion'
+        ? 'balanced'
         : 'spatial'
       : message.videoMode;
   if ((videoMode === 'motion' || videoMode === 'auto') && rateValue > 30)

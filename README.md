@@ -12,7 +12,8 @@ The app accepts a local media file by file picker or drag and drop, or a direct 
 - Exact source cadence up to 30 fps by default, compact 20 fps, and integer or common fractional frame-rate overrides through 60 fps
 - 220×176 RGB565 big-endian video with selectable RGB565, RGB555, RGB454, or RGB444 source precision and letterbox, crop, or stretch framing
 - A seekable single-frame 220×176 preview with letterbox, crop-to-fill, and stretch-to-fill framing
-- Lossless raw/LZ4 keyframes, aligned single- or multi-rectangle deltas, translated motion residuals, temporal XOR records, and repeats
+- Balanced motion by default through 30 fps: motion is selected only when it saves at least ten complete 512-byte sectors (5 KiB) against the best spatial candidate; higher rates default to spatial
+- Lossless raw/LZ4 keyframes, aligned single- or multi-rectangle deltas, and repeats, with independent-frame Spatial, maximum-savings Motion, and experimental Motion+XOR Auto modes available as explicit advanced options at 30 fps or lower
 - A configurable time-based indexed keyframe interval (five seconds by default)
 - 44.1 kHz adaptive IMA ADPCM that stores exact silence as zero bytes, exact dual mono as one channel, and other material as stereo
 - Exact per-frame audio boundaries for rational frame rates
@@ -27,14 +28,16 @@ The UI and conversion pipeline are static files suitable for GitHub Pages.
 
 1. [Mediabunny](https://mediabunny.dev/) demuxes the local file or direct URL with bounded read caches and analyzes the complete packet timeline before resolving the profile's source cadence.
 2. WebCodecs decodes video and audio in a dedicated worker when the browser supports the source codecs.
-3. If the container is readable but its codecs are not, the single-threaded [ffmpeg.wasm](https://ffmpegwasm.netlify.app/) compatibility path normalizes it to H.264/AAC while preserving video timestamps, then returns to the same canonical IPVF path.
+3. If the container is readable but its codecs are not, the single-threaded [ffmpeg.wasm](https://ffmpegwasm.netlify.app/) compatibility path normalizes it to VP8/Opus while preserving video timestamps, then returns to the same canonical IPVF path.
 4. A browser video canvas shows a seekable still preview at the exact 220×176 output ratio. The selected letterbox (`contain`), crop-to-fill (`cover`), or stretch-to-fill (`fill`) mode is passed to the worker.
 5. An `OffscreenCanvas` applies that framing and the chosen host color cleanup to every requested output frame. Pixels are packed as RGB565BE.
 6. Decoded audio is resampled on one absolute 44.1 kHz timeline with interpolation carried across adjacent decoder blocks, then written into an OPFS temporary file. Sources without audio and uncovered time become silence; excess audio is trimmed to the video duration. Each record selects silence, mono, or stereo anchored IMA ADPCM.
-7. IPVF records are incrementally written to OPFS. The encoder evaluates raw/LZ4 keys, repeats, bounded spatial rectangles, translated motion residuals, and optional full-frame XOR candidates using final sector cost. The browser uses the deterministic built-in LZ4 implementation; host-library LZ4 modes from the Python CLI are not applicable in a static browser build.
+7. IPVF records are incrementally written to OPFS. Through 30 fps, the balanced default evaluates raw/LZ4 keys, repeats, bounded spatial rectangles, and translated motion residuals, but accepts motion only for a saving of at least ten complete sectors (5 KiB) against the best spatial record. Higher rates default to spatial. Explicit Motion keeps the size-first one-sector rule, while experimental Auto also evaluates full-frame XOR candidates. The browser uses the deterministic built-in LZ4 implementation; host-library LZ4 modes from the Python CLI are not applicable in a static browser build.
 8. The validator re-reads the finished file from OPFS. Download uses a file-backed `Blob`; “Save as” streams directly to a user-selected destination when the File System Access API is available.
 
 The software fallback is intentionally single-threaded. GitHub Pages cannot set the cross-origin isolation headers required by the multithreaded ffmpeg.wasm core. The WebCodecs path remains the preferred path because it is faster and avoids an intermediate compatibility transcode.
+
+Balanced is the recommended default because a one-sector file-size saving is not a measured budget for the player's CPU, DRAM, or display cost. In the reference CLI analysis of the 5,686-frame, 25 fps Mr. Brightside source, the ten-sector policy produced 182,950,112 bytes with 2,794 motion records: 1.85% larger than size-first Motion, but with 31.59% fewer full-frame motion reconstructions, while retaining 91.19% of Motion's possible saving versus Spatial. Spatial removes motion reconstruction entirely but measured 21.02% larger than size-first Motion on this source. The browser's end-to-end encode with its built-in LZ4 independently validated at 175,870,176 bytes with 1,746 motion records, 3,842 spatial rectangle records, 52 repeats, and 46 indexed LZ4 keys. Image quality, audio, cadence, and duration are unchanged because selection is lossless and every mode reconstructs the same RGB565 frames and audio timeline.
 
 ## Browser support
 

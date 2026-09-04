@@ -870,23 +870,32 @@ export default function App() {
                           )
                         }
                       >
-                        <option value="default">Automatic</option>
-                        <option value="current">Bounds only</option>
-                        <option value="spatial">Spatial rectangles</option>
+                        <option value="default">
+                          Default — Balanced ≤30 / Spatial &gt;30
+                        </option>
+                        <option value="current">Bounds only (spatial)</option>
+                        <option value="spatial">
+                          Spatial — independent-frame safety
+                        </option>
                         <option
                           value="motion"
                           disabled={frameRatePreset === '60/1'}
                         >
-                          Motion + spatial
+                          Motion — maximum size savings (≤30 fps)
                         </option>
                         <option
                           value="auto"
                           disabled={frameRatePreset === '60/1'}
                         >
-                          Motion + XOR + spatial
+                          Auto — motion + XOR (experimental, ≤30 fps)
                         </option>
                       </select>
                     </label>
+                    <p className="text-[10px] leading-4 text-white/50">
+                      Through 30 fps, Default uses motion only for meaningful
+                      per-frame wins of at least 5 KiB; above 30 fps it uses
+                      Spatial. Explicit Motion prioritizes the smallest file.
+                    </p>
                     <div className="grid grid-cols-2 gap-2">
                       <label className="text-[11px] text-white/60">
                         Key interval (sec)
